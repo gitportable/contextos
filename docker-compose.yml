@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: contextos-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: contextos
+      POSTGRES_USER: contextos
+      POSTGRES_PASSWORD: contextos_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - contextos_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contextos -d contextos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  contextos_pgdata:
