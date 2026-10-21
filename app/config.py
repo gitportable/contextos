@@ -15,7 +15,7 @@ def _has_host(url: str) -> bool:
 
 class Settings(BaseSettings):
     # --- core -------------------------------------------------------------
-    database_url: str = "postgresql+psycopg2://contextos:contextos_dev_password@localhost:5432/contextos"
+    database_url: str = "postgresql+psycopg2://contextos:BMSCE2026s@localhost:5432/contextos"
     app_env: str = "development"
     app_timezone: str = "Asia/Kolkata"
     worker_poll_seconds: float = 1.0
