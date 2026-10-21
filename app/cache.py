@@ -30,10 +30,17 @@ def set_json(key,value,ttl=15):
     try: c.setex(key,ttl,json.dumps(value,default=str))
     except Exception: pass
 
-def invalidate_message_caches():
+def invalidate_user_caches(owner_id):
+    """Cache keys are namespaced per ContextOS user so one user's data can never be served to another."""
     c=client()
     if not c: return
     try:
-        for key in c.scan_iter("contextos:messages:*"): c.delete(key)
-        for key in c.scan_iter("contextos:summary"): c.delete(key)
+        for key in c.scan_iter(f"contextos:u{owner_id}:*"): c.delete(key)
+    except Exception: pass
+
+def invalidate_message_caches():  # backwards-compatible: drop everything
+    c=client()
+    if not c: return
+    try:
+        for key in c.scan_iter("contextos:u*"): c.delete(key)
     except Exception: pass

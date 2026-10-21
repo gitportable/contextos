@@ -1,34 +1,33 @@
-# ContextOS — Slack ingestion MVP (first vertical slice)
+# ContextOS
 
-This starter implements the first end-to-end backend slice:
+ContextOS is a multi-user Slack productivity application. Each person signs in to a ContextOS account, authorizes their own Slack user account, and sees their own Slack messages, reminders, projects, and schedule suggestions. The deployment owner has a separate admin view for system-wide pipeline and configuration status.
 
-1. FastAPI receives Slack Events API callbacks.
-2. It verifies Slack's HMAC signature and timestamp.
-3. It deduplicates callbacks using Slack `event_id`.
-4. It stores ordinary user messages in PostgreSQL.
-5. A transparent rules-based scorer assigns P0–P3 and stores the reasons.
-6. `GET /messages` exposes the priority-ordered inbox data.
+The app is an actively developed MVP. Review its privacy, security, and operational requirements before exposing it to real users.
 
-**This is a development scaffold, not production-ready.** It does not yet implement OAuth/token storage, historical sync, edits/deletions, reminders, MCP, multi-user tenant authorization, or a frontend. Do not expose it publicly with real data until those controls are implemented.
+## What is implemented
 
-## 1. Prerequisites
+- Email/password registration and sign-in, optional Google sign-in, server-side sessions, and account/session settings.
+- Per-ContextOS-user Slack OAuth connections, Slack history sync, signed Events API intake, and a PostgreSQL-backed worker queue.
+- A personal inbox, priority scores, reminders, schedule suggestions, project discovery, briefings, and an assistant with message citations.
+- Slack directory search and assignment of Slack people to reminders and schedule suggestions.
+- Optional Redis, Qdrant, Neo4j, LLM providers, and Google Calendar integration.
+- Owner-only pipeline overview, event feed, trace, and integration status.
 
-- Python 3.11+
-- Docker Desktop (for PostgreSQL)
-- A Slack workspace where you can create an app
-- For local webhook testing, a tunnel such as ngrok or Cloudflare Tunnel
+See [explanation.md](./explanation.md) for how these pieces work, [architecture.md](./architecture.md) for components and data flow, [api.md](./api.md) for HTTP endpoints and request conventions, and [database.md](./database.md) for what is stored in each database/service.
 
-## 2. Start the database
+## Requirements
 
-From this folder in VS Code terminal:
+- Python 3.11 or newer.
+- PostgreSQL (the included `docker-compose.yml` provides a local database).
+- A Slack app with OAuth configured for workspaces you intend to support.
+- A public HTTPS tunnel or deployment URL for Slack callbacks/events during local development.
+
+## Local setup (PowerShell)
+
+From the repository root:
 
 ```powershell
 docker compose up -d
-```
-
-## 3. Configure Python
-
-```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -36,65 +35,82 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and set `SLACK_SIGNING_SECRET` to the Signing Secret from your Slack app. Keep `.env` private and never commit it.
+Set the required values in `.env` before starting:
 
-## 4. Run the API
+- `DATABASE_URL`: PostgreSQL connection string.
+- `PUBLIC_BASE_URL`: the exact public HTTPS origin used in the browser (for example, your current ngrok URL, without a trailing slash).
+- `ADMIN_EMAIL`: the ContextOS login email that owns the deployment.
+- `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_SIGNING_SECRET`.
+- `TOKEN_ENCRYPTION_KEY`: generate with `python -m app.crypto`; keep it stable while encrypted tokens are stored.
+
+Optional:
+
+- Google sign-in uses `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+- Install `requirements-integrations.txt` for optional Qdrant, Neo4j, and MCP-related integrations.
+- Configure LLM keys (`GROQ_API_KEY` and/or `GEMINI_API_KEY`) for generated answers and summaries. Without a provider, the app uses non-LLM fallbacks.
+- Redis, Qdrant, Neo4j, and Google Calendar can be left unconfigured when not used.
+
+Never commit `.env` or share its secrets. The `.env.example` file is a template, not a source of credentials.
+
+## Configure Slack
+
+In the Slack app configuration:
+
+1. Under **OAuth & Permissions**, add the redirect URL:
+   `https://YOUR_PUBLIC_HOST/integrations/slack/callback`
+2. Set `SLACK_REDIRECT_URI` to that exact URL, or leave it empty to derive it from `PUBLIC_BASE_URL`.
+3. If using Event Subscriptions, set the Request URL to:
+   `https://YOUR_PUBLIC_HOST/integrations/slack/events`
+   These URLs are different: OAuth returns through `/callback`; Slack event delivery uses `/events`.
+4. Enable distribution/installation for the workspaces that should be allowed to authorize the app. Workspace administrators may need to approve it.
+
+Each user must sign in to ContextOS and authorize their own Slack workspace. Slack can reuse whichever Slack account is already active in that browser, so the user should check the workspace selector on Slack's consent screen. ContextOS associates the OAuth result with the signed-in ContextOS user; it does not choose a Slack workspace from an email address.
+
+The browser's default read preset requests user scopes for channels the user can access, direct messages, and directory names. Private channels/group DMs and sending replies require additional user choices. Avoid adding permissions that the product does not need.
+
+## Database and run
+
+Apply migrations to an existing database:
 
 ```powershell
-uvicorn app.main:app --reload
+python -m alembic upgrade head
 ```
 
-Check:
-- Health: http://127.0.0.1:8000/health
-- Interactive API docs: http://127.0.0.1:8000/docs
-- Inbox endpoint: http://127.0.0.1:8000/messages
+For a brand-new development database, the app can create missing tables when `AUTO_CREATE_TABLES=true`. Migrations are the preferred way to upgrade a database. The legacy-schema reset script deletes development data; use it only when that data is disposable.
 
-The first run creates the MVP tables automatically. For a production application, replace `create_all()` with Alembic migrations.
+Start the API and worker in separate terminals:
 
-## 5. Configure Slack Events API
+```powershell
+python -m uvicorn app.main:app --reload --port 8000
+python -m app.worker
+```
 
-In the Slack API dashboard for your app:
+Open the app through `PUBLIC_BASE_URL` when using OAuth or a tunnel. Useful endpoints:
 
-1. Enable **Event Subscriptions**.
-2. Set the Request URL to `https://YOUR_PUBLIC_TUNNEL/integrations/slack/events`.
-3. Slack validates the URL with a signed `url_verification` request.
-4. Subscribe to the bot event `message.channels` for public channels. Add other message scopes only when needed and after reviewing the privacy implications.
-5. Under **OAuth & Permissions**, add the minimum bot scope required for the channels you want to read (for public-channel message events, typically `channels:history`; posting is not needed for this ingestion-only slice).
-6. Install/reinstall the app to the workspace and invite it to a test channel if required by the selected scopes.
+- `/health` — database-backed health check.
+- `/docs` — interactive OpenAPI docs in development only.
+- `/api/config` — safe public UI feature flags.
 
-Slack scopes, event subscriptions, and visibility depend on whether the app uses bot or user tokens and which channel types you need. Start with a private test workspace/channel. Never ask users for their Slack password.
+The worker is required to process queued history sync, event, and maintenance jobs.
 
-## 6. Test the pipeline
+## Tests
 
-1. Start the API and tunnel.
-2. Post a test message in a channel the app can access, such as: `Can you review this today? We are blocked.`
-3. Open `/messages`. The stored message should show a higher priority than a simple FYI.
-4. Try `/messages?priority=P1` to filter.
+Install development dependencies and run the tests:
 
-The endpoint only ingests standard message events in this first pass. It skips bot messages and message subtypes; edit/delete reconciliation is a later step. Slack may retry events, so the event receipt table makes retries idempotent.
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+```
 
-## Priority rules in this starter
+Some tests require external services to be disabled or configured with isolated test values; do not point test runs at a production database.
 
-- Direct action/request language: +20
-- Near-term deadline wording: +25
-- Blocker/incident wording: +25
-- Decision/approval language: +10
-- FYI wording and very short messages reduce the score
-- P0 is reserved for a critical incident phrase plus blocker language
+## Deployment notes
 
-These are baseline heuristics, not an AI classifier. They should be tested against labeled examples and tuned from user feedback before real-world use. A VIP list, project importance, message/thread context, user-specific preferences, and an LLM classifier are not yet included.
+Before production, use HTTPS, a strong and backed-up token-encryption key, PostgreSQL backups, correct proxy configuration, restricted registration, monitoring, dependency pinning, and reviewed Slack scopes. Set `APP_ENV=production` to disable demo functionality and the interactive API docs. Confirm the actual configuration in `.env`; do not copy secrets into documentation or source control.
 
-## Current database tables
+## Documentation
 
-- `event_receipts`: one row per Slack Events API `event_id`, used for retry deduplication.
-- `slack_messages`: canonical MVP message record with team/channel/timestamp, text, score, label, reason, and ingestion times.
-
-## Next implementation milestones
-
-1. Add tests for signature validation, duplicate events, and priority scoring.
-2. Implement Slack OAuth install/callback and encrypted per-workspace token storage.
-3. Add message edits/deletions and initial history sync with rate-limit handling.
-4. Add user identity, workspace authorization, project mapping, handled/snoozed state.
-5. Add durable reminders and a worker/outbox pattern.
-6. Add MCP tools over authorized stored data (search, thread context, priority, open commitments, propose reminder).
-7. Add frontend inbox and feedback-driven scoring.
+- [API reference and HTTP request flow](./api.md)
+- [Application explanation](./explanation.md)
+- [Architecture and data lifecycle](./architecture.md)
+- [Database and storage map](./database.md)

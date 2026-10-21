@@ -1,6 +1,7 @@
 .env
-.venv/
+.env-backup
+token.json
+credentials.json
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.env.example
+.venv/
+*.pyc
