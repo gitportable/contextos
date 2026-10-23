@@ -106,7 +106,31 @@ Some tests require external services to be disabled or configured with isolated 
 
 ## Deployment notes
 
-Before production, use HTTPS, a strong and backed-up token-encryption key, PostgreSQL backups, correct proxy configuration, restricted registration, monitoring, dependency pinning, and reviewed Slack scopes. Set `APP_ENV=production` to disable demo functionality and the interactive API docs. Confirm the actual configuration in `.env`; do not copy secrets into documentation or source control.
+### Deploying the API to Vercel with Supabase Postgres
+
+The URL `https://eeydzmanaorwpfbdpyrg.supabase.co` is the Supabase API/project URL, not a PostgreSQL connection string. In Supabase, open **Project Settings > Database > Connection string**, select the **Transaction pooler** option, and copy its URI. Use that complete URI as Vercel's `DATABASE_URL`; append `?sslmode=require` if it is not already present. The database password is available/reset in the Supabase database settings. Never put it in source control or in a public client variable.
+
+1. In Vercel, import this repository and set the project root to `contextos-slack-mvp` (the directory containing this README and `requirements.txt`).
+2. Add these Vercel environment variables:
+   - `DATABASE_URL`: the Supabase PostgreSQL pooler URI.
+   - `APP_ENV=production`
+   - `AUTO_CREATE_TABLES=false`
+   - `PUBLIC_BASE_URL=https://YOUR_VERCEL_DOMAIN` (no trailing slash; use the stable production domain).
+   - `ADMIN_EMAIL`, `TOKEN_ENCRYPTION_KEY`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_SIGNING_SECRET`.
+   - Add any optional provider credentials you use, such as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+3. Before serving traffic, apply the schema once from a trusted machine using the same `DATABASE_URL`:
+
+   ```powershell
+   python -m alembic upgrade head
+   ```
+
+4. Deploy. The included Vercel configuration routes the app to FastAPI and includes the static UI files. Update Slack's OAuth redirect URL to `https://YOUR_VERCEL_DOMAIN/integrations/slack/callback` and its Events API URL to `https://YOUR_VERCEL_DOMAIN/integrations/slack/events`.
+
+Production database connections use a small per-instance pool to reduce connection pressure from serverless instances. Use Supabase's pooler URI rather than a direct database URI for Vercel.
+
+Vercel serves the HTTP API, but it does not run the app's continuous PostgreSQL queue worker. Slack sync and other queued jobs will not run unless you also run `python -m app.worker` as a separate persistent process with the same environment variables (including `DATABASE_URL`) on a worker host. Use a host that supports a continuously running Python process; do not run the worker as a Vercel function.
+
+Before production, use HTTPS, a strong and backed-up token-encryption key, PostgreSQL backups, correct proxy configuration, restricted registration, monitoring, dependency pinning, and reviewed Slack scopes. Set `APP_ENV=production` to disable demo functionality and the interactive API docs. Keep credentials in deployment environment variables; do not copy secrets into documentation or source control.
 
 ## Documentation
 

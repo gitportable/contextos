@@ -6,7 +6,12 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from app.config import settings
 
 log = logging.getLogger("contextos.db")
-_kw = {} if settings.database_url.startswith("sqlite") else {"pool_size": 10, "max_overflow": 20, "pool_recycle": 1800, "pool_timeout": 15}
+if settings.database_url.startswith("sqlite"):
+    _kw = {}
+elif settings.app_env == "production":
+    _kw = {"pool_size": 1, "max_overflow": 0, "pool_recycle": 1800, "pool_timeout": 15}
+else:
+    _kw = {"pool_size": 10, "max_overflow": 20, "pool_recycle": 1800, "pool_timeout": 15}
 engine = create_engine(settings.database_url, pool_pre_ping=True, **_kw)  # bounded pool: a traffic spike queues instead of exhausting Postgres
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 

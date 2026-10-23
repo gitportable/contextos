@@ -1,5 +1,6 @@
 from urllib.parse import urlparse
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -94,6 +95,15 @@ class Settings(BaseSettings):
     neo4j_database: str = "neo4j"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @field_validator("database_url")
+    @classmethod
+    def use_installed_postgres_driver(cls, url: str) -> str:
+        if url.startswith("postgresql://"):
+            return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        if url.startswith("postgres://"):
+            return url.replace("postgres://", "postgresql+psycopg2://", 1)
+        return url
 
     # --- derived ----------------------------------------------------------
     @property
