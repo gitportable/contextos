@@ -1,241 +1,194 @@
-import hmac
+import hashlib
 import json
 import logging
+import queue
+import threading
 import time
-from datetime import datetime, timezone
+import uuid
+from contextlib import asynccontextmanager
+from datetime import timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
-from sqlalchemy import case, desc, func, or_, text
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import desc, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import auth, google_auth, ratelimit, security
-from app.validators import normalize_email, password_problems, valid_email
-from app.trace import log_event
-from app.summaries import esc_like, open_url
-from app.routes_app import router as app_router
+from app import assistant, auth, ratelimit
 from app.cache import get_json, invalidate_user_caches, set_json
 from app.config import settings
 from app.crypto import TokenCryptoError
-from app.database import get_db, init_db
+from app.database import SessionLocal, get_db, init_db
 from app.integrations import create_calendar_event, index_messages, integration_status
-from app.models import (EventReceipt, Project, OutboundAction, ProcessingJob, Reminder, SlackConnection, SlackConversation,
-                        SlackMessage, SlackUser, SuggestedEvent, User, UserSession, utcnow)
-from app.schemas import (AssigneesUpdate, EventCreate, LoginIn, PasswordChange, ProfileUpdate, RegisterIn, ReminderCreate, SlackReply)
+from app.models import (EventReceipt, MessageProject, OutboundAction, ProcessingJob, Reminder, SlackConnection, SlackConversation, SlackMessage, SuggestedEvent,
+                        User, utcnow)
+from app.routes_account import router as account_router
+from app.routes_auth import router as auth_router
+from app.routes_pipeline import router as pipeline_router
+from app.routes_projects import router as projects_router
+from app.routes_gmail import router as gmail_router
+from app.routes_google_calendar import router as google_calendar_router
+from app.routes_intelligence import router as intelligence_router
+from app.routes_items import router as items_router
+from app.routes_slack import router as slack_router
+from app.schemas import AssistantQuery, EventCreate, ReminderCreate, SlackChannelPost, SlackReply
+from app.serializers import message_dicts
 from app.slack_client import (SlackAmbiguousError, SlackApiError, SlackAuthError, SlackChannelError, SlackClient, SlackRateLimited,
                               SlackScopeError, SlackTransportError)
 from app.slack_events import accept_event
 from app.slack_oauth import get_token, mark_needs_reauth
 from app.slack_signing import InvalidSlackSignature, verify_slack_request
 from app.slack_sync import enqueue_sync
-from app.routes_slack import router as slack_router
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("contextos")
-init_db()
-dev = settings.app_env == "development"
-app = FastAPI(title="ContextOS Pipeline API", version="0.5.0", docs_url="/docs" if dev else None, redoc_url=None, openapi_url="/openapi.json" if dev else None,
-              description="Per-user Slack OAuth, durable queue, resumable sync, priority scoring, reminders, schedule suggestions, grounded retrieval and approved Slack replies.")
-security.install(app)
-app.include_router(slack_router)
-app.include_router(app_router)
+STATIC_DIR = Path(__file__).parent / "static"
 PRIORITIES = ("P0", "P1", "P2", "P3")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    problems = settings.production_problems()
+    for line in problems:
+        (logger.error if line.startswith("FATAL") else logger.warning)(line)
+    if settings.is_production and any(p.startswith("FATAL") for p in problems):
+        raise RuntimeError("Refusing to start in production with fatal configuration problems (see log above).")
+    init_db()
+    yield
+
+
+app = FastAPI(title="ContextOS Pipeline API", version="0.5.0", lifespan=lifespan,
+              docs_url="/docs" if not settings.is_production else None, redoc_url=None,
+              openapi_url="/openapi.json" if not settings.is_production else None,
+              description="Google sign-in, per-user Slack OAuth, durable queue, resumable sync, priority scoring, projects, LLM summaries, grounded assistant.")
+for _r in (auth_router, slack_router, gmail_router, google_calendar_router, projects_router, pipeline_router, account_router, intelligence_router, items_router):
+    app.include_router(_r)
 
 
 def err(status: int, code: str, message: str, **extra):
     return HTTPException(status_code=status, detail={"code": code, "message": message, **extra})
 
 
+# ------------------------------------------------------------- middleware ---
+class BodyLimitMiddleware:
+    """Pure-ASGI request-size cap: counts the bytes actually received (Content-Length can lie or be absent when chunked)."""
+    def __init__(self, app, max_bytes: int):
+        self.app, self.max_bytes = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        declared = dict(scope["headers"]).get(b"content-length")
+        if declared and declared.isdigit() and int(declared) > self.max_bytes:
+            return await JSONResponse(status_code=413, content={"detail": {"code": "too_large", "message": "Request body too large."}})(scope, receive, send)
+        seen = 0
+
+        async def limited():
+            nonlocal seen
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body", b""))
+                if seen > self.max_bytes:
+                    raise HTTPException(status_code=413, detail={"code": "too_large", "message": "Request body too large."})
+            return msg
+        await self.app(scope, limited, send)
+
+
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://lh3.googleusercontent.com; "
+       "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    rid = request.headers.get("x-request-id", "")[:64] or uuid.uuid4().hex[:12]
+    if request.method not in auth.SAFE_METHODS:
+        # Defence in depth next to SameSite cookies + CSRF tokens: a browser always sends Origin on cross-site writes.
+        origin = request.headers.get("origin")
+        if origin and origin != "null":
+            host = urlparse(origin).netloc.lower()
+            allowed = {request.headers.get("host", "").lower(), urlparse(settings.public_base_url).netloc.lower()}
+            if host not in allowed:
+                return JSONResponse(status_code=403, content={"detail": {"code": "bad_origin", "message": "Cross-site request blocked."}})
+        elif origin == "null":
+            return JSONResponse(status_code=403, content={"detail": {"code": "bad_origin", "message": "Cross-site request blocked."}})
+    try:
+        response = await call_next(request)
+    except HTTPException as exc:  # raised by BodyLimitMiddleware inside the stack
+        response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    response.headers["X-Request-ID"] = rid
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = CSP
+    if settings.cookie_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    path = request.url.path
+    if not path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"  # authenticated JSON and the app shell must never sit in a shared cache
+    return response
+
+
+app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
+
+
+@app.exception_handler(ratelimit.RateLimited)
+async def _rate_limited(_request: Request, exc: ratelimit.RateLimited):
+    return ratelimit.rate_limit_response(exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation(_request: Request, exc: RequestValidationError):
+    first = (exc.errors() or [{}])[0]
+    field = ".".join(str(x) for x in first.get("loc", []) if x not in ("body", "query", "path"))
+    return JSONResponse(status_code=422, content={"detail": {"code": "invalid_input", "message": f"Please check {field or 'your input'}: {first.get('msg', 'invalid value')}."}})
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    # Never leak stack traces, SQL or file paths to the client; the full error goes to the log with the request id.
+    logger.exception("unhandled_error path=%s", request.url.path)
+    return JSONResponse(status_code=500, content={"detail": {"code": "server_error", "message": "Something went wrong on our side. Please try again."}})
+
+
 # ------------------------------------------------------------------ basics ---
-@app.get("/static/{name}", include_in_schema=False)
-def static_file(name: str):
-    f = (Path(__file__).parent / "static" / name).resolve()
-    if f.parent != (Path(__file__).parent / "static").resolve() or not f.is_file() or f.suffix not in (".js", ".css", ".svg"):
-        raise HTTPException(status_code=404)
-    return FileResponse(f)
-
-
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    ui = Path(__file__).parent / "static" / "index.html"
-    return FileResponse(ui) if ui.exists() else {"app": "ContextOS", "status": "running", "docs": "/docs"}
+    ui = STATIC_DIR / "index.html"
+    return FileResponse(ui) if ui.exists() else {"app": "ContextOS", "status": "running"}
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/api/config")
 def public_config():
-    return {"demo_enabled": settings.demo_enabled, "registration_open": settings.allow_registration,
-            "google_enabled": settings.google_enabled}
+    return {"demo_enabled": settings.demo_enabled, "registration_open": settings.allow_registration and settings.allow_password_auth,
+            "password_auth": settings.allow_password_auth, "google_login": settings.google_oauth_configured,
+            "slack_oauth_configured": settings.slack_oauth_configured, "llm_enabled": settings.llm_enabled, "env": settings.app_env}
 
 
 @app.get("/health")
-def health(db: Session = Depends(get_db)):
-    db.execute(text("SELECT 1"))
+def health():
+    """Liveness: the process is up. No dependencies touched, so an orchestrator never restarts us because the DB blipped."""
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def ready(db: Session = Depends(get_db)):
+    """Readiness: can we serve traffic? Database is required; Redis is optional and only reported."""
+    db.execute(text("SELECT 1"))
+    return {"status": "ready"}
+
+
 @app.get("/api/integrations")
-def integrations(user: User = Depends(auth.admin_user)):
+def integrations(user: User = Depends(auth.require_admin)):
     return integration_status()
-
-
-# -------------------------------------------------------------------- auth ---
-def client_ip(request: Request) -> str:
-    if settings.trust_proxy:
-        fwd = request.headers.get("x-forwarded-for", "")
-        if fwd:
-            return fwd.split(",")[0].strip()[:64]
-    return (request.client.host if request.client else "unknown")[:64]
-
-
-def _session_response(db, user, response):
-    user.last_login_at = utcnow()
-    raw, sess = auth.create_session(db, user)
-    old = db.query(auth.UserSession).filter_by(user_id=user.id).order_by(auth.UserSession.id.desc()).offset(10).all()  # cap sessions per user
-    for o in old:
-        db.delete(o)
-    db.commit()
-    auth.set_session_cookie(response, raw)
-    return {"user": auth.user_payload(user), "csrf_token": sess.csrf_token}
-
-
-@app.post("/auth/register")
-def register(data: RegisterIn, request: Request, response: Response, db: Session = Depends(get_db)):
-    if not settings.allow_registration:
-        raise err(403, "registration_closed", "Registration is disabled.")
-    ok, wait = ratelimit.hit(f"register:ip:{client_ip(request)}", 10, 3600)
-    if not ok:
-        raise err(429, "too_many_attempts", "Too many sign-up attempts from this network. Try again later.", retry_after=wait)
-    email = normalize_email(data.email)
-    if not valid_email(email):
-        raise err(400, "bad_email", "Enter a valid email address, like name@example.com.")
-    problems = password_problems(data.password, email)
-    if problems:
-        raise err(400, "weak_password", "Password needs: " + ", ".join(problems) + ".", problems=problems)
-    user = User(email=email, name=(data.name.strip() or email.split("@")[0])[:200], password_hash=auth.hash_password(data.password))
-    try:
-        db.add(user); db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise err(409, "email_taken", "An account with that email already exists. Sign in instead.")
-    log_event(db, "auth", "ok", "account created (password)", owner_id=user.id); db.commit()
-    return _session_response(db, user, response)
-
-
-@app.post("/auth/login")
-def login(data: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
-    email, ip = normalize_email(data.email), client_ip(request)
-    if not valid_email(email):
-        raise err(400, "bad_email", "Enter a valid email address, like name@example.com.")
-    pkey, ekey, ikey = f"login:pair:{email}:{ip}", f"login:email:{email}", f"login:ip:{ip}"
-    wait = ratelimit.lock_remaining(pkey, ekey, ikey)
-    if wait:
-        raise err(429, "locked", f"Too many failed attempts. Try again in {wait // 60 + 1} min.", retry_after=wait)
-    user = db.query(User).filter_by(email=email).first()
-    ok = auth.verify_password(data.password, user.password_hash if user else "scrypt$16384$8$1$AAAA$AAAA")  # same cost either way
-    if not user or not ok or not user.is_active:
-        # 5 tries per (email, network) so an attacker cannot lock YOUR account from their own IP; 20 per email overall stops distributed guessing
-        remaining, lock = ratelimit.record_failure(pkey, settings.login_max_attempts)
-        _, lock_e = ratelimit.record_failure(ekey, settings.login_max_attempts * 4)
-        ratelimit.record_failure(ikey, settings.login_ip_max_attempts)
-        lock = lock or lock_e
-        log_event(db, "auth", "error", "failed sign-in" + (" (account now locked)" if lock else ""), owner_id=user.id if user else None); db.commit()
-        if lock:
-            raise err(429, "locked", f"Too many failed attempts. Locked for {lock // 60} min.", retry_after=lock)
-        raise err(401, "bad_credentials", f"Incorrect email or password. {remaining} attempt(s) left before a temporary lock.", attempts_left=remaining)
-    ratelimit.clear_failures(pkey)
-    log_event(db, "auth", "ok", "signed in (password)", owner_id=user.id)
-    return _session_response(db, user, response)
-
-
-@app.get("/auth/google/start")
-def google_start(db: Session = Depends(get_db)):
-    try:
-        url, state = google_auth.start(db)
-    except google_auth.GoogleAuthError as exc:
-        return RedirectResponse(f"/?login=error&reason={exc.code}", status_code=302)
-    resp = RedirectResponse(url, status_code=302)  # the state is also pinned to THIS browser, so a forged callback link cannot log a victim in as someone else
-    resp.set_cookie("contextos_gstate", state, max_age=600, httponly=True, samesite="lax", secure=settings.cookie_secure, path="/auth/google")
-    return resp
-
-
-@app.get("/auth/google/callback")
-def google_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None, db: Session = Depends(get_db)):
-    ok, _ = ratelimit.hit(f"google:ip:{client_ip(request)}", 30, 600)
-    if error or not ok:
-        return RedirectResponse("/?login=error&reason=" + ("cancelled" if error else "rate_limited"), status_code=302)
-    if not state or not hmac.compare_digest(request.cookies.get("contextos_gstate", ""), state):
-        return RedirectResponse("/?login=error&reason=invalid_state", status_code=302)
-    try:
-        user = google_auth.finish(db, code, state)
-    except google_auth.GoogleAuthError as exc:
-        return RedirectResponse(f"/?login=error&reason={exc.code}", status_code=302)
-    resp = RedirectResponse("/?welcome=1", status_code=302)
-    resp.delete_cookie("contextos_gstate", path="/auth/google")
-    _session_response(db, user, resp)
-    log_event(db, "auth", "ok", "signed in with Google", owner_id=user.id); db.commit()
-    return resp
-
-
-@app.get("/auth/me")
-def me(ctx=Depends(auth.optional_context)):
-    if ctx is None:
-        return {"authenticated": False}
-    return {"authenticated": True, "user": auth.user_payload(ctx.user), "csrf_token": ctx.session.csrf_token}
-
-
-@app.post("/auth/logout")
-def logout(response: Response, ctx=Depends(auth.auth_context), db: Session = Depends(get_db)):
-    db.delete(ctx.session); db.commit()
-    auth.clear_session_cookie(response)
-    return {"ok": True}
-
-
-@app.patch("/auth/account")
-def update_account(data: ProfileUpdate, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
-    name = data.name.strip()
-    if not name:
-        raise err(400, "bad_name", "Enter a display name.")
-    user.name = name
-    db.commit()
-    return auth.user_payload(user)
-
-
-@app.post("/auth/password")
-def change_password(data: PasswordChange, ctx=Depends(auth.auth_context), db: Session = Depends(get_db)):
-    user = ctx.user
-    if user.password_hash == "!":
-        raise err(409, "password_login_unavailable", "This account uses Google sign-in and has no password to change.")
-    if not auth.verify_password(data.current_password, user.password_hash):
-        raise err(400, "incorrect_password", "Your current password is incorrect.")
-    problems = password_problems(data.new_password, user.email)
-    if problems:
-        raise err(400, "weak_password", "Password needs: " + ", ".join(problems) + ".", problems=problems)
-    user.password_hash = auth.hash_password(data.new_password)
-    db.query(UserSession).filter(UserSession.user_id == user.id, UserSession.id != ctx.session.id).delete(synchronize_session=False)
-    db.commit()
-    return {"ok": True}
-
-
-@app.get("/auth/sessions")
-def list_sessions(ctx=Depends(auth.auth_context), db: Session = Depends(get_db)):
-    rows = db.query(UserSession).filter(UserSession.user_id == ctx.user.id, UserSession.expires_at > utcnow()).order_by(desc(UserSession.created_at)).all()
-    return [{"id": row.id, "created_at": row.created_at.isoformat(), "expires_at": row.expires_at.isoformat(),
-             "current": row.id == ctx.session.id} for row in rows]
-
-
-@app.delete("/auth/sessions/{session_id}")
-def revoke_session(session_id: int, ctx=Depends(auth.auth_context), db: Session = Depends(get_db)):
-    row = db.query(UserSession).filter_by(id=session_id, user_id=ctx.user.id).first()
-    if not row:
-        raise err(404, "not_found", "Session not found.")
-    if row.id == ctx.session.id:
-        raise err(400, "current_session", "Sign out to end your current session.")
-    db.delete(row)
-    db.commit()
-    return {"ok": True}
 
 
 # ------------------------------------------------------------ slack events ---
@@ -243,8 +196,6 @@ def revoke_session(session_id: int, ctx=Depends(auth.auth_context), db: Session 
 async def slack_events(request: Request, db: Session = Depends(get_db),
                        x_slack_request_timestamp: str | None = Header(default=None), x_slack_signature: str | None = Header(default=None)):
     raw_body = await request.body()
-    if len(raw_body) > settings.max_body_bytes:
-        raise HTTPException(status_code=413, detail="Payload too large")
     try:
         verify_slack_request(raw_body, x_slack_request_timestamp, x_slack_signature)
     except InvalidSlackSignature as exc:
@@ -257,6 +208,8 @@ async def slack_events(request: Request, db: Session = Depends(get_db),
         return {"challenge": payload.get("challenge", "")}
     if not payload.get("event_id"):
         raise HTTPException(status_code=400, detail="Missing event_id")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
     result = accept_event(db, payload)  # durable receipt + job before answering 200
     logger.info("slack_event %s", result)
     return result
@@ -268,41 +221,64 @@ def legacy_sync_history():
 
 
 # ---------------------------------------------------------------- messages ---
-from app.views import inbox as _inbox, message_dicts, own_message as _own_message
+def _inbox(db: Session, user: User, include_self: bool = False):
+    q = db.query(SlackMessage).filter(SlackMessage.owner_id == user.id, SlackMessage.is_deleted.is_(False))
+    return q if include_self else q.filter(SlackMessage.is_self.is_(False))
 
 
 @app.get("/messages")
 def list_messages(limit: int = 50, priority: str | None = None, include_self: bool = False, channel_id: str | None = None,
-                  q: str | None = None, project_id: int | None = None, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+                  q: str | None = None, project_id: int | None = None, source: str | None = None, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     limit = max(1, min(limit, 200))
-    if priority and priority.upper() not in PRIORITIES:
-        raise HTTPException(status_code=400, detail="priority must be P0, P1, P2, or P3")
-    q = (q or "").strip()[:100] or None
-    key = f"contextos:u{user.id}:messages:{limit}:{(priority or 'all').upper()}:{int(include_self)}:{channel_id or ''}:{q or ''}:{project_id or ''}"
+    if source not in (None, "slack", "gmail"):
+        raise err(400, "bad_source", "source must be slack or gmail")
+    priority_filter = priority.lower() if priority else None
+    if priority_filter and priority_filter not in ("important", "urgent", "high", "normal") and priority.upper() not in PRIORITIES:
+        raise err(400, "bad_priority", "priority must be important, urgent, high, normal, P0, P1, P2, or P3")
+    q = (q or "").strip()[:200] or None
+    params = f"{limit}|{(priority or 'all').upper()}|{int(include_self)}|{channel_id or ''}|{q or ''}|{project_id or ''}|{source or ''}"
+    key = f"contextos:u{user.id}:messages:{hashlib.sha256(params.encode()).hexdigest()[:24]}"
     cached = get_json(key)
     if cached is not None:
         return cached
-    event_message_ids = {message_id for (message_id,) in db.query(SuggestedEvent.message_id).filter(
-        SuggestedEvent.owner_id == user.id, SuggestedEvent.status == "suggested", SuggestedEvent.message_id.isnot(None)).all()}
-    if include_self:
-        query = _inbox(db, user, True)
-    elif event_message_ids:
-        query = _inbox(db, user, True).filter(or_(SlackMessage.is_self.is_(False), SlackMessage.id.in_(event_message_ids)))
-    else:
-        query = _inbox(db, user, False)
-    if priority:
+    query = _inbox(db, user, include_self)
+    if priority_filter == "urgent":
+        query = query.filter(SlackMessage.priority_label.in_(("P0", "P1")))
+    elif priority_filter == "high":
+        query = query.filter(SlackMessage.priority_label == "P1")
+    elif priority_filter == "normal":
+        query = query.filter(SlackMessage.priority_label.in_(("P2", "P3")))
+    elif priority and priority_filter != "important":
         query = query.filter(SlackMessage.priority_label == priority.upper())
+    if source:
+        query = query.join(SlackConnection, SlackConnection.id == SlackMessage.connection_id).filter(SlackConnection.provider == source)
     if channel_id:
         query = query.filter(SlackMessage.channel_id == channel_id)
     if project_id:
-        query = query.filter(SlackMessage.project_id == project_id)
+        query = query.join(MessageProject, MessageProject.message_id == SlackMessage.id).filter(MessageProject.project_id == project_id)
     if q:
-        query = query.filter(SlackMessage.text.ilike(f"%{esc_like(q)}%", escape="\\"))
-    ordering = [case((SlackMessage.id.in_(event_message_ids), 0), else_=1)] if event_message_ids else []
-    rows = query.order_by(*ordering, desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).limit(limit).all()
+        esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = query.filter(SlackMessage.text.ilike(f"%{esc}%", escape="\\"))
+    if priority_filter == "important" and not q:
+        rows = []
+        for label in PRIORITIES:
+            row = (query.filter(SlackMessage.priority_label == label)
+                   .order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at))
+                   .first())
+            if row:
+                rows.append(row)
+    else:
+        rows = query.order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).limit(limit).all()
     result = message_dicts(db, rows)
     set_json(key, result, ttl=15)
     return result
+
+
+def _own_message(db: Session, user: User, message_id: int) -> SlackMessage:
+    row = db.query(SlackMessage).filter_by(id=message_id, owner_id=user.id).first()
+    if not row:
+        raise err(404, "not_found", "Message not found.")
+    return row
 
 
 @app.get("/messages/{message_id}")
@@ -320,8 +296,14 @@ def reply_to_slack(message_id: int, data: SlackReply, user: User = Depends(auth.
     """Authenticated, ownership-checked, explicit-approval reply. Token chosen server-side from the user's own connection."""
     if not data.approved:
         raise err(409, "approval_required", "Reply not sent. Confirm the reviewed text before sending.")
+    try:
+        ratelimit.hit("reply:user", str(user.id), 60, 3600, "You've sent a lot of replies this hour. Please wait a bit.")
+    except ratelimit.RateLimited as exc:
+        raise ratelimit.ensure_http(exc) from exc
     row = _own_message(db, user, message_id)
     conn = db.query(SlackConnection).filter_by(id=row.connection_id, owner_id=user.id).first()
+    if conn is not None and conn.provider != "slack":
+        raise err(409, "read_only_source", "Email is read-only in ContextOS. Reply from your mail app.")
     if not conn or conn.status != "connected":
         raise err(409, "connection_inactive", "This Slack connection is not active. Reconnect Slack to reply.")
     key = (data.client_request_id or "").strip() or None
@@ -382,6 +364,82 @@ def reply_to_slack(message_id: int, data: SlackReply, user: User = Depends(auth.
     return {"ok": True, **_action_dict(audit), "channel": row.channel_id, "thread_ts": thread_ts}
 
 
+@app.post("/channels/{connection_id}/{channel_id}/messages")
+def post_to_slack_channel(connection_id: int, channel_id: str, data: SlackChannelPost,
+                          user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    if not data.approved:
+        raise err(409, "approval_required", "Message not sent. Review and confirm the text before sending.")
+    if not data.text.strip():
+        raise err(422, "empty_message", "Write a message before posting.")
+    try:
+        ratelimit.hit("reply:user", str(user.id), 60, 3600, "You've sent a lot of replies this hour. Please wait a bit.")
+    except ratelimit.RateLimited as exc:
+        raise ratelimit.ensure_http(exc) from exc
+    conn = db.query(SlackConnection).filter_by(id=connection_id, owner_id=user.id, provider="slack").first()
+    if not conn or conn.status != "connected":
+        raise err(409, "connection_inactive", "This Slack connection is not active. Reconnect Slack to post.")
+    conversation = db.query(SlackConversation).filter_by(
+        connection_id=conn.id, channel_id=channel_id, is_active=True, is_archived=False,
+    ).first()
+    if not conversation or conversation.conv_type not in ("public_channel", "private_channel"):
+        raise err(404, "channel_not_found", "That channel isn't available in your connected Slack workspace.")
+
+    key = (data.client_request_id or "").strip() or None
+    if key:
+        prior = db.query(OutboundAction).filter_by(owner_id=user.id, idempotency_key=key).first()
+        if prior:
+            if prior.status in ("sent", "confirmed", "simulated"):
+                return {"ok": True, "replayed": True, **_action_dict(prior)}
+            raise err(409, "duplicate_request", f"This message request already exists with status '{prior.status}'. Check Slack before resending.", action_id=prior.id)
+    body = {"channel": channel_id, "text": data.text}
+    audit = OutboundAction(owner_id=user.id, connection_id=conn.id, idempotency_key=key,
+                           action_type="slack_channel_post", team_id=conn.team_id, channel_id=channel_id,
+                           send_as="user", request_json=json.dumps(body), status="sending")
+    try:
+        db.add(audit)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise err(409, "duplicate_request", "This message request is already being processed.")
+
+    def fail(status: int, code: str, message: str, audit_status: str = "failed", **extra):
+        audit.status, audit.error = audit_status, f"{code}: {message}"[:1000]
+        db.commit()
+        return err(status, code, message, action_id=audit.id, **extra)
+
+    if conn.is_demo:
+        audit.status, audit.external_id = "simulated", f"demo.{int(time.time())}"
+        db.commit()
+        return {"ok": True, "simulated": True, "note": "Demo connection: nothing was sent to Slack.", **_action_dict(audit)}
+    if not conn.has_scope("chat:write", "user"):
+        raise fail(403, "missing_scope", "Your Slack authorization lacks chat:write. Reconnect Slack and approve it.", needed="chat:write")
+    try:
+        token = get_token(db, conn, "user")
+        with SlackClient(token, max_inline_wait=0) as client:
+            result = client.call("chat.postMessage", json_body=body, idempotent=False)
+    except SlackAmbiguousError:
+        audit.status, audit.error = "unknown", "Timed out; Slack may or may not have posted it. Check the channel before retrying."
+        enqueue_sync(db, conn, "reconcile", channel_id=channel_id)
+        db.commit()
+        raise err(504, "ambiguous", "Slack did not answer in time. Check the channel before retrying; ContextOS will reconcile.", action_id=audit.id)
+    except SlackRateLimited as exc:
+        raise fail(429, "ratelimited", f"Slack rate limit hit. Try again in {exc.retry_after}s.", retry_after=exc.retry_after)
+    except (SlackAuthError, TokenCryptoError) as exc:
+        mark_needs_reauth(db, conn, getattr(exc, "code", "token_error"))
+        raise fail(409, "token_revoked", "Slack access expired or was revoked. Reconnect Slack.")
+    except SlackScopeError as exc:
+        raise fail(403, "missing_scope", "Slack says a permission is missing. Reconnect Slack and approve it.", needed=exc.needed)
+    except SlackChannelError as exc:
+        raise fail(409, exc.code, f"Slack refused the message for this channel ({exc.code}).")
+    except (SlackTransportError, SlackApiError) as exc:
+        raise fail(502, exc.code, f"Slack rejected the message ({exc.code}).")
+    audit.status, audit.external_id = "sent", str(result.get("ts", ""))
+    enqueue_sync(db, conn, "reconcile", channel_id=channel_id)
+    db.commit()
+    invalidate_user_caches(user.id)
+    return {"ok": True, **_action_dict(audit), "channel": channel_id}
+
+
 @app.get("/actions")
 def list_actions(limit: int = 100, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     rows = db.query(OutboundAction).filter_by(owner_id=user.id).order_by(desc(OutboundAction.created_at)).limit(max(1, min(limit, 200))).all()
@@ -396,29 +454,29 @@ def _conn_ids(db, user):
 def _user_jobs(db, user):
     ids = _conn_ids(db, user)
     teams = [t for (t,) in db.query(SlackConnection.team_id).filter_by(owner_id=user.id).all()]
-    return db.query(ProcessingJob).filter(or_(ProcessingJob.connection_id.in_(ids), ProcessingJob.team_id.in_(teams))), set(ids)
+    return db.query(ProcessingJob).filter(or_(ProcessingJob.connection_id.in_(ids), ProcessingJob.team_id.in_(teams), ProcessingJob.owner_id == user.id)), set(ids)
 
 
 @app.get("/queue/summary")
-def queue_summary(user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def queue_summary(user: User = Depends(auth.require_admin), db: Session = Depends(get_db)):
     base, _ = _user_jobs(db, user)
     rows = base.with_entities(ProcessingJob.status, func.count(ProcessingJob.id)).group_by(ProcessingJob.status).all()
     return {"jobs_by_status": {s: c for s, c in rows}, "worker": "run `python -m app.worker` in a second terminal"}
 
 
 @app.get("/queue/jobs")
-def queue_jobs(status: str | None = None, limit: int = 100, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def queue_jobs(status: str | None = None, limit: int = 100, user: User = Depends(auth.require_admin), db: Session = Depends(get_db)):
     base, mine = _user_jobs(db, user)
     if status:
         base = base.filter(ProcessingJob.status == status)
     rows = base.order_by(desc(ProcessingJob.created_at)).limit(max(1, min(limit, 200))).all()
     return [{"id": j.id, "job_type": j.job_type, "status": j.status, "attempts": j.attempts, "max_attempts": j.max_attempts,
              "available_at": j.available_at.isoformat(), "created_at": j.created_at.isoformat(),
-             "last_error": j.last_error if j.connection_id in mine else None} for j in rows]
+             "last_error": j.last_error if (j.connection_id in mine or j.owner_id == user.id) else None} for j in rows]
 
 
 def _metrics(db: Session, user: User) -> dict:
-    base = _inbox(db, user)
+    base = _inbox(db, user, include_self=True)
     prios = {p: c for p, c in base.with_entities(SlackMessage.priority_label, func.count(SlackMessage.id)).group_by(SlackMessage.priority_label).all()}
     jobs_q, _ = _user_jobs(db, user)
     jobs = {s: c for s, c in jobs_q.with_entities(ProcessingJob.status, func.count(ProcessingJob.id)).group_by(ProcessingJob.status).all()}
@@ -433,7 +491,7 @@ def _metrics(db: Session, user: User) -> dict:
 
 
 @app.get("/api/pipeline/metrics")
-def pipeline_metrics(user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def pipeline_metrics(user: User = Depends(auth.require_admin), db: Session = Depends(get_db)):
     return _metrics(db, user)
 
 
@@ -445,37 +503,8 @@ def dashboard_summary(user: User = Depends(auth.current_user), db: Session = Dep
 
 
 # --------------------------------------------------------------- reminders ---
-def _decode_assignees(raw: str) -> list[dict]:
-    return json.loads(raw or "[]")
-
-
-def _resolve_assignees(db: Session, user: User, ids: list[str]) -> str:
-    ids = list(dict.fromkeys(ids))
-    if len(ids) > 20:
-        raise err(400, "too_many_assignees", "Choose no more than 20 people.")
-    teams = [t for (t,) in db.query(SlackConnection.team_id).filter_by(owner_id=user.id, status="connected").all()]
-    parsed = [value.split(":", 1) for value in ids]
-    if any(len(pair) != 2 or pair[0] not in teams for pair in parsed):
-        raise err(400, "invalid_assignee", "One or more selected people are not in your connected Slack workspace.")
-    found = {(person.team_id, person.user_id): person for person in
-             db.query(SlackUser).filter(SlackUser.team_id.in_(teams), SlackUser.is_bot.is_(False)).all()} if teams else {}
-    result = []
-    for team_id, slack_user_id in parsed:
-        person = found.get((team_id, slack_user_id))
-        if not person:
-            raise err(400, "invalid_assignee", "One or more selected people are not in your connected Slack workspace.")
-        result.append({"id": f"{team_id}:{slack_user_id}", "name": person.display_name,
-                       "username": person.username, "email": person.email, "team": team_id})
-    return json.dumps(result, separators=(",", ":"))
-
-
-def _has_assignee(raw: str, person_id: str | None) -> bool:
-    return not person_id or any(person["id"] == person_id for person in _decode_assignees(raw))
-
-
 def _rem(r: Reminder) -> dict:
-    return {"id": r.id, "message_id": r.message_id, "title": r.title, "due_at": r.due_at.isoformat(),
-            "status": r.status, "assignees": _decode_assignees(r.assigned_people)}
+    return {"id": r.id, "message_id": r.message_id, "title": r.title, "due_at": r.due_at.isoformat(), "status": r.status}
 
 
 @app.post("/reminders")
@@ -483,19 +512,16 @@ def create_reminder(data: ReminderCreate, user: User = Depends(auth.current_user
     if data.message_id:
         _own_message(db, user, data.message_id)
     due = data.due_at if data.due_at.tzinfo else data.due_at.replace(tzinfo=timezone.utc)
-    row = Reminder(owner_id=user.id, title=data.title, due_at=due, message_id=data.message_id,
-                   assigned_people=_resolve_assignees(db, user, data.assignees))
+    row = Reminder(owner_id=user.id, title=data.title, due_at=due, message_id=data.message_id)
     db.add(row); db.commit(); db.refresh(row)
     return _rem(row)
 
 
 @app.get("/reminders")
-def list_reminders(status: str = "pending", limit: int = 100, person_id: str | None = None,
-                   user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def list_reminders(status: str = "pending", limit: int = 100, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     q = db.query(Reminder).filter(Reminder.owner_id == user.id)
     q = q.filter(Reminder.status != "cancelled") if status == "all" else q.filter(Reminder.status == status)
-    return [_rem(r) for r in q.order_by(Reminder.due_at).limit(max(1, min(limit, 500))).all()
-            if _has_assignee(r.assigned_people, person_id)]
+    return [_rem(r) for r in q.order_by(Reminder.due_at).limit(max(1, min(limit, 200))).all()]
 
 
 @app.post("/reminders/{reminder_id}/complete")
@@ -508,23 +534,10 @@ def complete_reminder(reminder_id: int, user: User = Depends(auth.current_user),
     return {"ok": True, "id": row.id, "status": row.status}
 
 
-@app.patch("/reminders/{reminder_id}/assignees")
-def assign_reminder(reminder_id: int, data: AssigneesUpdate, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
-    row = db.query(Reminder).filter_by(id=reminder_id, owner_id=user.id).first()
-    if not row:
-        raise err(404, "not_found", "Reminder not found.")
-    row.assigned_people = _resolve_assignees(db, user, data.assignees)
-    db.commit()
-    return _rem(row)
-
-
 # ---------------------------------------------------------------- schedule ---
-def _ev(e: SuggestedEvent, message: SlackMessage | None = None) -> dict:
+def _ev(e: SuggestedEvent) -> dict:
     return {"id": e.id, "message_id": e.message_id, "title": e.title, "proposed_start": e.proposed_start.isoformat(),
-            "duration_minutes": e.duration_minutes, "status": e.status, "source_text": e.source_text,
-            "is_provisional": e.is_provisional, "assignees": _decode_assignees(e.assigned_people),
-            "priority_label": message.priority_label if message else None,
-            "priority_score": message.priority_score if message else None}
+            "duration_minutes": e.duration_minutes, "status": e.status, "source_text": e.source_text, "is_provisional": e.is_provisional}
 
 
 def _own_event(db, user, event_id):
@@ -535,24 +548,10 @@ def _own_event(db, user, event_id):
 
 
 @app.get("/schedule/suggestions")
-def list_suggestions(status: str = "suggested", person_id: str | None = None,
-                     user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def list_suggestions(status: str = "suggested", user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     q = db.query(SuggestedEvent).filter(SuggestedEvent.owner_id == user.id)
     q = q.filter(SuggestedEvent.status != "cancelled") if status == "all" else q.filter(SuggestedEvent.status == status)
-    events = q.order_by(SuggestedEvent.proposed_start).limit(500).all()
-    message_ids = {event.message_id for event in events if event.message_id is not None}
-    messages = {message.id: message for message in db.query(SlackMessage).filter(
-        SlackMessage.owner_id == user.id, SlackMessage.id.in_(message_ids)).all()} if message_ids else {}
-    result, seen = [], set()
-    for event in events:
-        if not _has_assignee(event.assigned_people, person_id):
-            continue
-        key = (event.title.casefold(), event.proposed_start.replace(second=0, microsecond=0), event.status)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(_ev(event, messages.get(event.message_id)))
-    return result
+    return [_ev(e) for e in q.order_by(SuggestedEvent.proposed_start).limit(200).all()]
 
 
 @app.post("/schedule/suggestions")
@@ -561,8 +560,7 @@ def create_schedule_suggestion(data: EventCreate, user: User = Depends(auth.curr
         _own_message(db, user, data.message_id)
     start = data.proposed_start if data.proposed_start.tzinfo else data.proposed_start.replace(tzinfo=timezone.utc)
     row = SuggestedEvent(owner_id=user.id, message_id=data.message_id, title=data.title, proposed_start=start,
-                         duration_minutes=data.duration_minutes, source_text=data.source_text,
-                         assigned_people=_resolve_assignees(db, user, data.assignees))
+                         duration_minutes=data.duration_minutes, source_text=data.source_text)
     db.add(row); db.commit(); db.refresh(row)
     return _ev(row)
 
@@ -572,14 +570,6 @@ def approve_suggestion(event_id: int, user: User = Depends(auth.current_user), d
     row = _own_event(db, user, event_id)
     row.status = "approved"; db.commit()
     return {"ok": True, "id": row.id, "status": "approved", "note": "Approval recorded. Calendar creation needs Google Calendar OAuth."}
-
-
-@app.patch("/schedule/suggestions/{event_id}/assignees")
-def assign_event(event_id: int, data: AssigneesUpdate, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
-    row = _own_event(db, user, event_id)
-    row.assigned_people = _resolve_assignees(db, user, data.assignees)
-    db.commit()
-    return _ev(row)
 
 
 @app.post("/schedule/suggestions/{event_id}/approve-and-create")
@@ -594,14 +584,72 @@ def approve_and_create_calendar_event(event_id: int, user: User = Depends(auth.c
     return {"ok": True, "id": row.id, "status": "created", "calendar": created}
 
 
-# (assistant, projects, today, pipeline: see routes_app.py)
+# --------------------------------------------------------------- assistant ---
+@app.post("/assistant/ask/stream")
+def assistant_ask_stream(data: AssistantQuery, user: User = Depends(auth.current_user)):
+    owner_id = user.id
+    try:
+        ratelimit.hit("assistant:user", str(owner_id), settings.rl_assistant_user_per_hour, 3600,
+                      "You've asked a lot of questions this hour. Please try again in a little while.")
+    except ratelimit.RateLimited as exc:
+        raise ratelimit.ensure_http(exc) from exc
+
+    def events():
+        updates: queue.Queue = queue.Queue()
+        finished = object()
+
+        def generate():
+            db = SessionLocal()
+            try:
+                stream_user = db.query(User).filter_by(id=owner_id).first()
+                if stream_user is None:
+                    raise RuntimeError("The signed-in user no longer exists.")
+                history = [{"role": turn.role, "content": turn.content} for turn in data.history]
+                result = assistant.ask(db, stream_user, data.question.strip(),
+                                       history=history,
+                                       on_token=lambda token: updates.put(("token", {"text": token})))
+                updates.put(("done", result))
+            except Exception:
+                logger.exception("assistant_stream_failed user_id=%s", owner_id)
+                updates.put(("error", {"message": "The assistant could not finish this response. Please try again."}))
+            finally:
+                db.close()
+                updates.put(finished)
+
+        threading.Thread(target=generate, daemon=True).start()
+        while True:
+            item = updates.get()
+            if item is finished:
+                break
+            event, payload = item
+            yield f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/assistant/ask")
+def assistant_ask(data: AssistantQuery, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    try:
+        ratelimit.hit("assistant:user", str(user.id), settings.rl_assistant_user_per_hour, 3600,
+                      "You've asked a lot of questions this hour. Please try again in a little while.")
+    except ratelimit.RateLimited as exc:
+        raise ratelimit.ensure_http(exc) from exc
+    history = [{"role": turn.role, "content": turn.content} for turn in data.history]
+    result = assistant.ask(db, user, data.question.strip(), history=history)
+    result["vector_search"] = "configured" if settings.qdrant_enabled else "not_configured"
+    return result
 
 
 @app.post("/integrations/qdrant/reindex")
 def qdrant_reindex(limit: int = 500, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    try:
+        ratelimit.hit("expensive:user", str(user.id), settings.rl_expensive_user_per_hour, 3600)
+    except ratelimit.RateLimited as exc:
+        raise ratelimit.ensure_http(exc) from exc
     if not settings.qdrant_enabled:
         raise err(503, "not_configured", "Configure QDRANT_URL first (a bare 'https://' placeholder counts as unset).")
-    rows = (_inbox(db, user, include_self=True).filter(SlackMessage.indexed_at.is_(None)).order_by(SlackMessage.id.desc())
+    rows = (_inbox(db, user, include_self=True).filter(SlackMessage.indexed_at.is_(None), SlackMessage.priority_label != "P3").order_by(SlackMessage.id.desc())
             .limit(max(1, min(limit, 5000))).all())
     ok, errors = 0, []
     for i in range(0, len(rows), 64):
@@ -620,11 +668,24 @@ def qdrant_reindex(limit: int = 500, user: User = Depends(auth.current_user), db
 
 # -------------------------------------------------------------------- demo ---
 @app.post("/api/demo/seed")
-def demo_seed(process: bool = True, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def demo_seed(background: BackgroundTasks, size: str = "full", user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     if not settings.demo_enabled:
         raise err(403, "demo_disabled", "Demo data is disabled (set ENABLE_DEMO=true or APP_ENV=development).")
+    if size not in ("small", "full"):
+        raise err(400, "bad_size", "size must be small or full")
+    try:
+        ratelimit.hit("expensive:user", str(user.id), settings.rl_expensive_user_per_hour, 3600)
+    except ratelimit.RateLimited as exc:
+        raise ratelimit.ensure_http(exc) from exc
     from app.demo import seed_demo
-    return seed_demo(db, user, process=process)
+    from app.worker import run_pending_jobs, worker_online
+    result = seed_demo(db, user, size=size)
+    if worker_online(db):
+        result["processing"] = "worker"
+    else:  # nobody is draining the queue: do it in this process, after the response, so the pipeline page can show it live
+        background.add_task(run_pending_jobs, 20000, 90.0)
+        result["processing"] = "in-process (no worker heartbeat found)"
+    return result
 
 
 @app.post("/api/demo/reset")

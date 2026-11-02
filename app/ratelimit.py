@@ -1,103 +1,227 @@
-"""Rate limiting and login lockout.
+"""Rate limiting + login lockout.
 
-Counters live in Redis when configured (fast, shared) and in PostgreSQL otherwise (durable, shared across workers).
-The DB backend uses its OWN session, so recording a failed login can never commit/rollback a caller's transaction.
-Security counters FAIL CLOSED for lockouts (they are DB-backed) and FAIL OPEN for generic API limits if Redis dies.
+Backend: Redis when REDIS_URL works (shared by every worker/process, survives restarts); otherwise an in-process
+fallback so limits still apply (fail CLOSED to a weaker limiter, never open). The fallback is per-process and resets
+on restart: production_problems() warns when REDIS_URL is empty.
+
+Counters use INCR + TTL repair, so a crash between INCR and EXPIRE cannot leave an immortal key (which would be a
+permanent lock-out).
 """
+import hashlib
+import ipaddress
 import logging
-from datetime import timedelta
+import math
+import threading
+import time
+from dataclasses import dataclass
+
+from fastapi import HTTPException, Request
 
 from app import cache
 from app.config import settings
-from app.database import SessionLocal
-from app.models import RateLimit, as_utc, utcnow
 
 log = logging.getLogger("contextos.ratelimit")
 
 
-def hit(key: str, limit: int, window_seconds: int) -> tuple[bool, int]:
-    """Count one request. Returns (allowed, retry_after_seconds)."""
-    r = cache.client()
-    if r:
+class RateLimited(Exception):
+    def __init__(self, retry_after: int, scope: str, message: str = ""):
+        super().__init__(message or f"rate limited: {scope}")
+        self.retry_after, self.scope = max(1, int(math.ceil(retry_after))), scope
+        self.message = message or "Too many requests. Please wait a moment and try again."
+
+
+@dataclass
+class Hit:
+    count: int
+    ttl: int
+
+
+class _Memory:
+    """Bounded in-process fallback store: key -> (count, expires_at_monotonic)."""
+    MAX_KEYS = 20000
+
+    def __init__(self):
+        self._d: dict[str, tuple[int, float]] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        if len(self._d) > self.MAX_KEYS:
+            for k in [k for k, (_, exp) in self._d.items() if exp <= now][: self.MAX_KEYS // 2]:
+                self._d.pop(k, None)
+            while len(self._d) > self.MAX_KEYS:  # still full of live keys: drop the oldest-expiring
+                self._d.pop(min(self._d, key=lambda k: self._d[k][1]), None)
+
+    def incr(self, key: str, window: int) -> Hit:
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            count, exp = self._d.get(key, (0, 0.0))
+            if exp <= now:
+                count, exp = 0, now + window
+            count += 1
+            self._d[key] = (count, exp)
+            return Hit(count, int(math.ceil(exp - now)))
+
+    def get(self, key: str) -> Hit:
+        now = time.monotonic()
+        with self._lock:
+            count, exp = self._d.get(key, (0, 0.0))
+            return Hit(count, int(math.ceil(exp - now))) if exp > now else Hit(0, 0)
+
+    def set(self, key: str, count: int, ttl: int) -> None:
+        with self._lock:
+            self._d[key] = (count, time.monotonic() + ttl)
+
+    def delete(self, *keys: str) -> None:
+        with self._lock:
+            for k in keys:
+                self._d.pop(k, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+
+
+_mem = _Memory()
+
+
+def reset_for_tests() -> None:
+    _mem.clear()
+
+
+def _incr(key: str, window: int) -> Hit:
+    c = cache.client()
+    if c:
         try:
-            full = f"contextos:rl:{key}"
-            pipe = r.pipeline()
-            pipe.incr(full)
-            pipe.ttl(full)
+            pipe = c.pipeline()
+            pipe.incr(key)
+            pipe.ttl(key)
             count, ttl = pipe.execute()
-            if ttl < 0:
-                r.expire(full, window_seconds); ttl = window_seconds
-            return (count <= limit), (0 if count <= limit else max(1, ttl))
-        except Exception:
-            log.warning("redis rate limit unavailable; using database")
-    with SessionLocal() as db:
-        now = utcnow()
-        row = db.query(RateLimit).filter_by(key=key).first()
-        if row is None:
-            try:
-                db.add(RateLimit(key=key, count=0, window_start=now)); db.commit()
-            except Exception:
-                db.rollback()
-            row = db.query(RateLimit).filter_by(key=key).first()
-        if now - as_utc(row.window_start) > timedelta(seconds=window_seconds):
-            db.query(RateLimit).filter_by(key=key).update({"count": 0, "window_start": now})
-            db.commit()
-            row = db.query(RateLimit).filter_by(key=key).first()
-        db.query(RateLimit).filter_by(key=key).update({RateLimit.count: RateLimit.count + 1})  # atomic increment
-        db.commit()
-        count = db.query(RateLimit.count).filter_by(key=key).scalar()
-        retry = max(1, int(window_seconds - (now - as_utc(row.window_start)).total_seconds()))
-        return (count <= limit), (0 if count <= limit else retry)
+            if ttl is None or ttl < 0:  # first hit, or TTL lost
+                c.expire(key, window)
+                ttl = window
+            return Hit(int(count), int(ttl))
+        except Exception as exc:
+            log.warning("redis_ratelimit_error %s; using in-process fallback", type(exc).__name__)
+            cache.mark_down()
+    return _mem.incr(key, window)
 
 
-def peek(key: str) -> int:
-    r = cache.client()
-    if r:
+def _peek(key: str) -> Hit:
+    c = cache.client()
+    if c:
         try:
-            return int(r.get(f"contextos:rl:{key}") or 0)
+            pipe = c.pipeline()
+            pipe.get(key)
+            pipe.ttl(key)
+            v, ttl = pipe.execute()
+            return Hit(int(v or 0), max(0, int(ttl or 0)))
         except Exception:
-            pass
-    with SessionLocal() as db:
-        return db.query(RateLimit.count).filter_by(key=key).scalar() or 0
+            cache.mark_down()
+    return _mem.get(key)
 
 
-# ------------------------------------------------------------- login guard ---
-def lock_remaining(*keys: str) -> int:
-    """Seconds until the earliest of these keys unlocks (0 if none is locked)."""
-    with SessionLocal() as db:
-        now, worst = utcnow(), 0
-        for k in keys:
-            row = db.query(RateLimit).filter_by(key=k).first()
-            if row and row.locked_until and as_utc(row.locked_until) > now:
-                worst = max(worst, int((as_utc(row.locked_until) - now).total_seconds()) + 1)
-        return worst
+def _set(key: str, count: int, ttl: int) -> None:
+    c = cache.client()
+    if c:
+        try:
+            c.setex(key, ttl, count)
+            return
+        except Exception:
+            cache.mark_down()
+    _mem.set(key, count, ttl)
 
 
-def record_failure(key: str, max_attempts: int) -> tuple[int, int]:
-    """Register a failed attempt. Returns (attempts_remaining, lock_seconds). Lockouts double (cap 24 h)."""
-    with SessionLocal() as db:
-        now = utcnow()
-        row = db.query(RateLimit).filter_by(key=key).first()
-        if row is None:
+def _delete(*keys: str) -> None:
+    c = cache.client()
+    if c:
+        try:
+            c.delete(*keys)
+        except Exception:
+            cache.mark_down()
+    _mem.delete(*keys)
+
+
+def _h(value: str) -> str:
+    return hashlib.sha256((value or "").encode()).hexdigest()[:20]
+
+
+# ----------------------------------------------------------------- generic ---
+def hit(scope: str, ident: str, limit: int, window: int, message: str = "") -> Hit:
+    """Count one event; raise RateLimited when the window's budget is spent."""
+    res = _incr(f"rl:{scope}:{ident}", window)
+    if res.count > limit:
+        raise RateLimited(res.ttl or window, scope, message)
+    return res
+
+
+def client_ip(request: Request) -> str:
+    """Peer address, or the Nth-from-right X-Forwarded-For entry when TRUSTED_PROXY_HOPS>0.
+    Taking entries from the RIGHT means a client cannot forge its own address by sending its own header."""
+    peer = request.client.host if request.client else "unknown"
+    hops = settings.trusted_proxy_hops
+    if hops > 0:
+        parts = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
+        if len(parts) >= hops:
+            cand = parts[-hops]
             try:
-                db.add(RateLimit(key=key, count=0, window_start=now)); db.commit()
-            except Exception:
-                db.rollback()
-            row = db.query(RateLimit).filter_by(key=key).first()
-        if now - as_utc(row.window_start) > timedelta(seconds=settings.login_window_seconds):
-            db.query(RateLimit).filter_by(key=key).update({"count": 0, "window_start": now}); db.commit()
-        db.query(RateLimit).filter_by(key=key).update({RateLimit.count: RateLimit.count + 1}); db.commit()
-        row = db.query(RateLimit).filter_by(key=key).first()
-        if row.count >= max_attempts:
-            lock = min(86400, settings.login_lockout_seconds * (2 ** row.strikes))
-            db.query(RateLimit).filter_by(key=key).update(
-                {"locked_until": now + timedelta(seconds=lock), "strikes": RateLimit.strikes + 1, "count": 0, "window_start": now})
-            db.commit()
-            return 0, lock
-        return max(0, max_attempts - row.count), 0
+                return str(ipaddress.ip_address(cand))
+            except ValueError:
+                pass
+    return peer
 
 
-def clear_failures(key: str) -> None:
-    with SessionLocal() as db:
-        db.query(RateLimit).filter_by(key=key).update({"count": 0, "strikes": 0, "locked_until": None})
-        db.commit()
+# ------------------------------------------------------------------- login ---
+def login_ip_gate(ip: str) -> None:
+    """Counts EVERY password sign-in attempt (even malformed ones) against the caller's network address."""
+    hit("login:ip", ip, settings.rl_login_ip_per_5min, 300, "Too many sign-in attempts from this network. Wait a few minutes.")
+
+
+def login_account_gate(email: str, ip: str) -> None:
+    """Call BEFORE touching the database/password hash. Raises RateLimited."""
+    lock = _peek(f"rl:lock:{_h(email)}:{_h(ip)}")
+    if lock.ttl > 0 and lock.count > 0:
+        raise RateLimited(lock.ttl, "login:lock", f"Too many failed sign-ins. Try again in {_fmt(lock.ttl)}, or continue with Google.")
+    em = _peek(f"rl:login:email:{_h(email)}")
+    if em.count >= settings.rl_login_email_fail_per_hour:
+        raise RateLimited(em.ttl or 3600, "login:email", "This account is temporarily protected from password guessing. Continue with Google or try again later.")
+
+
+def login_precheck(email: str, ip: str) -> None:
+    login_ip_gate(ip)
+    login_account_gate(email, ip)
+
+
+def login_failed(email: str, ip: str) -> None:
+    n = _incr(f"rl:login:pair:{_h(email)}:{_h(ip)}", 900).count
+    _incr(f"rl:login:email:{_h(email)}", 3600)
+    over = n - settings.rl_login_fail_lock_after
+    if over >= 0:
+        _set(f"rl:lock:{_h(email)}:{_h(ip)}", n, min(3600, 60 * (2 ** over)))  # 1, 2, 4, 8 ... min, capped at 1 h
+
+
+def login_succeeded(email: str, ip: str) -> None:
+    _delete(f"rl:login:pair:{_h(email)}:{_h(ip)}", f"rl:lock:{_h(email)}:{_h(ip)}")
+
+
+def _fmt(seconds: int) -> str:
+    return f"{seconds // 60 + 1} minute(s)" if seconds >= 60 else f"{seconds} second(s)"
+
+
+# --------------------------------------------------------- FastAPI helpers ---
+def limit_ip(scope: str, limit: int, window: int):
+    """Dependency factory: per-IP limit for unauthenticated endpoints."""
+    def dep(request: Request):
+        hit(scope, client_ip(request), limit, window)
+    return dep
+
+
+def rate_limit_response(exc: RateLimited):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=429, headers={"Retry-After": str(exc.retry_after)},
+                        content={"detail": {"code": "rate_limited", "message": exc.message, "retry_after": exc.retry_after, "scope": exc.scope}})
+
+
+def ensure_http(exc: RateLimited) -> HTTPException:
+    return HTTPException(status_code=429, headers={"Retry-After": str(exc.retry_after)},
+                         detail={"code": "rate_limited", "message": exc.message, "retry_after": exc.retry_after})

@@ -1,22 +1,17 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ContextOS</title><link rel="stylesheet" href="/static/app.css"></head><body>
-<header><div class="brand"><b>C</b>ContextOS</div><div><span class="status" id="apiStatus">● connecting</span> &nbsp; <span class="meta" id="who"></span> <button class="btn sm" data-act="refresh">Refresh</button> <button class="btn sm" id="logoutBtn" data-act="logout" hidden>Sign out</button></div></header>
-<div class="layout"><nav id="nav">
-<button class="item active" data-view="today">☀ Today</button><button class="item" data-view="inbox">▣ Priority inbox</button><button class="item" data-view="projects">◆ Projects</button>
-<button class="item" data-view="commitments">✓ Commitments &amp; schedule</button><button class="item" data-view="ask">✦ Ask</button><button class="item" data-view="pipeline" id="adminNav" hidden>⇄ Admin · Data pipeline</button><button class="item" data-view="settings">⚙ Account settings</button></nav>
-<main><div id="flash"></div><div id="view"></div><div class="foot">Nothing is sent to Slack or added to a calendar without your explicit approval. AI answers cite their source messages.</div></main></div>
-
-<div class="overlay" id="authOverlay"><div class="dialog" role="dialog" aria-labelledby="authTitle"><h2 id="authTitle">Sign in to ContextOS</h2><div class="hint" id="authSub">Your Slack priorities, projects and reminders in one place.</div>
-<div id="authErr" class="banner err" hidden></div>
-<a class="gbtn" id="googleBtn" href="/auth/google/start" hidden><svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8c4.4-4.1 7.1-10.1 7.1-17.5z"/><path fill="#FBBC05" d="M10.5 28.7c-.5-1.4-.8-3-.8-4.7s.3-3.2.8-4.7l-7.9-6.1C.9 16.4 0 20.1 0 24s.9 7.6 2.6 10.8l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.5-5.8c-2.1 1.4-4.9 2.3-8.4 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z"/></svg>Continue with Google</a>
-<div class="divider" id="orDiv" hidden>or use email</div>
-<form id="authForm" novalidate><div id="nameRow" hidden><label for="aName">Name</label><input id="aName" type="text" autocomplete="name" maxlength="100"></div>
-<label for="aEmail">Email</label><input id="aEmail" type="email" autocomplete="username" inputmode="email" maxlength="254" required><div class="hint" id="emailHint"></div>
-<label for="aPass">Password</label><input id="aPass" type="password" autocomplete="current-password" maxlength="200" required><div class="hint" id="passHint"></div>
-<div class="row"><button class="btn primary" id="authGo" type="submit">Sign in</button><button class="btn" id="authToggle" type="button" data-act="toggle-auth">Create account</button></div></form></div></div>
-
-<div class="overlay" id="replyOverlay"><div class="dialog wide" role="dialog" aria-labelledby="replyTitle"><h2 id="replyTitle">Reply</h2><div class="meta" id="replyCtx"></div><div id="replyErr" class="banner err" hidden></div><div id="replyBody"></div></div></div>
-<div class="overlay" id="traceOverlay"><div class="dialog wide" role="dialog" aria-label="Message trace"><div class="panelhead"><h2>How this message moved through the pipeline</h2><button class="btn sm" data-act="close-trace">Close</button></div><div id="traceBody"></div></div></div>
-<div class="toast" id="toast" role="status"><span id="toastMsg"></span><button id="toastUndo" hidden data-act="undo-send">Undo</button></div>
-<script src="/static/app.js" defer></script></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ContextOS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff593f'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'%3EC%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css?v=20261101-ask-diagnostics">
+</head>
+<body>
+<div id="app" aria-live="polite"><p class="boot">Loading ContextOS…</p></div>
+<div id="toasts" role="status" aria-live="polite"></div>
+<noscript><p class="boot">ContextOS needs JavaScript.</p></noscript>
+<script src="/static/app.js?v=20261101-ask-diagnostics" defer></script>
+</body>
+</html>

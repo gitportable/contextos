@@ -118,20 +118,33 @@ The response is a `302` redirect to Slack. After consent, Slack redirects to the
 | `GET` | `/messages` | User | List owned messages; filters include `limit`, `priority`, `include_self`, `channel_id`, `q`, `project_id` |
 | `GET` | `/messages/{message_id}` | User | Read one owned message |
 | `POST` | `/messages/{message_id}/reply` | User + CSRF | Send an explicitly approved reply using the user's connection; body includes reviewed text and `approved: true` |
+| `GET` | `/integrations/slack/channels` | User | List active channels in the caller's connected Slack workspaces and whether the user can post |
+| `POST` | `/channels/{connection_id}/{channel_id}/messages` | User + CSRF | Post reviewed text to an owned active Slack channel; requires `approved: true` and accepts `client_request_id` |
 | `GET` | `/actions` | User | List this user's outbound action audit records |
 | `POST` | `/messages/{message_id}/handled` | User + CSRF | Mark a message handled |
 | `POST` | `/messages/{message_id}/snooze` | User + CSRF | Snooze for a specified number of hours (default 4; range 1–168) |
 | `POST` | `/messages/{message_id}/suggest-reply` | User + CSRF | Generate a reply suggestion for an owned message; optional tone |
 
-The reply endpoint checks that the message and Slack connection belong to the caller, requires explicit approval, and honors an optional `client_request_id` idempotency key. A timeout may have an ambiguous outcome; check the action record and Slack before retrying. The inbox also includes the current user's source messages for active meeting suggestions, even when they were authored by the connected user.
+Both Slack send endpoints check that their message or channel and Slack connection belong to the caller, require explicit approval, and honor an optional `client_request_id` idempotency key. A timeout may have an ambiguous outcome; check the action record and Slack before retrying. Demo workspaces record simulated actions without sending to Slack.
 
-## Today, assistant, projects
+## Workspace, Ledger, assistant, projects
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `GET` | `/api/today` | User | Today's priority messages, reminders, suggestions, and waiting items |
 | `GET` | `/api/briefing?refresh=false` | User | Daily briefing; `refresh=true` requests regeneration and is rate-limited |
-| `POST` | `/assistant/ask` | User + CSRF | Ask about the caller's own stored data; returns answer and sources. Attention/today questions also search recent priority and linked meeting messages before vector results |
+| `GET` | `/api/items/brief?limit=7` | User | Ranked, capped Brief from confirmed active items; reports `scoring: rules_only` |
+| `GET` | `/api/items?state_filter=active&limit=100` | User | Owner-scoped Ledger items, ranked by transparent cold-start rules |
+| `POST` | `/api/items` | User + CSRF | Create a confirmed item; accepts title, kind, direction, optional due date, and validated source message IDs |
+| `PATCH` | `/api/items/{item_id}` | User + CSRF | Edit title/due date or change lifecycle state; requires `expected_version`, returns 409 on stale writes |
+| `DELETE` | `/api/items/{item_id}` | User + CSRF | Delete an owned item while retaining its PII-light event history |
+| `POST` | `/assistant/ask` | User + CSRF | Ask about the caller's own stored data; returns a concise answer and optional sources. Accepts up to 8 recent `{role, content}` turns for follow-up context. "Important today" queries only return recent priority messages that explicitly mention a deadline today. Person-directed message requests return a reviewable channel draft |
+| `POST` | `/assistant/ask/stream` | User + CSRF | Same grounded answer over server-sent events (`token`, then `done`; `error` on failure) so the browser can display generated text as it arrives; accepts the same bounded chat history |
+| `GET` | `/integrations/google-calendar/connection` | User | Return whether this user has a read-only Google Calendar connection |
+| `GET` | `/integrations/google-calendar/events/today` | User | Return actual Calendar events for today in the configured timezone; no message-derived meeting guesses |
+| `GET` | `/integrations/google-calendar/connect` | User | Start Google OAuth consent for read-only Calendar access |
+| `GET` | `/integrations/google-calendar/callback` | OAuth callback | Finish the user-bound Calendar OAuth flow and store encrypted tokens |
+| `POST` | `/integrations/google-calendar/disconnect` | User + CSRF | Revoke and remove this user's Calendar credentials |
 | `GET` | `/api/projects` | User | List owned projects; supports `include_archived` |
 | `GET` | `/api/projects/matches?keywords=...` | User | Preview owned, synced Slack messages matching comma-separated keywords |
 | `POST` | `/api/projects` | User + CSRF | Create/reactivate a project and immediately tag matching messages; body: `{ "name": "Nebula launch", "keywords": "nebula, nebula launch" }` |
@@ -140,9 +153,11 @@ The reply endpoint checks that the message and Slack connection belong to the ca
 | `PATCH` | `/api/projects/{project_id}` | User + CSRF | Update project properties such as name, keywords, or status |
 | `POST` | `/api/projects/discover` | User + CSRF | Trigger project discovery for current user |
 
+The browser uses `/assistant/ask/stream`; each `token` event contains a `text` delta, and the final `done` event contains the complete answer and citations. `/assistant/ask` remains available for non-streaming clients. Channel drafts are not sent automatically; the user selects a channel, reviews the text, and explicitly confirms before posting. The Workspace shows actual Google Calendar events; message text alone does not create meeting suggestions or commitments.
+
 Project keyword previews and tagging use the same case-insensitive whole-term matching. When a message matches multiple active projects, the most specific matching keyword wins; an equal-strength tie is left untagged rather than assigned arbitrarily. Newly tagged messages can then be filtered with `GET /messages?project_id=...`. Search operates on messages already stored by Slack sync; it does not fetch new Slack history. Automatic discovery also considers repeated structured message-title prefixes (for example, a product/cohort name before a dash).
 
-Calendar invites with an explicit month/day and time range are parsed as fixed, non-provisional events. Events whose local start date is today appear in Today under “Due today”; identical active suggestions are collapsed in Today and the schedule list.
+Manually created schedule suggestions remain available through the schedule API. The ingestion pipeline no longer creates guessed reminders or meeting suggestions from message text.
 
 ## Reminders and schedule suggestions
 

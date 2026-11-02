@@ -1,9 +1,7 @@
-"""Deterministic priority scoring and date extraction (no LLM key required).
+"""Structural priority scoring and legacy text parsing.
 
-Improvements over the MVP version:
-  * context-aware: mentions of you, DMs and @channel broadcasts change the score
-  * negation ("not urgent") does not trigger urgency
-  * due dates are computed in APP_TIMEZONE (not UTC) and understand clock times and weekdays
+Ranking deliberately ignores message text. The remaining regexes support existing assistant/date behavior
+until the item-extraction stage replaces those paths with confidence-aware structured extraction.
 """
 import re
 from datetime import date, datetime, time, timedelta, timezone
@@ -15,30 +13,14 @@ except ImportError:  # pragma: no cover
 
 from app.config import settings
 
-DEADLINE_RE = re.compile(r"\b(today|tonight|tomorrow|eod|end of day|asap|urgent|by \d{1,2}(?::\d{2})?\s?(?:am|pm)?)\b", re.I)
 REQUEST_RE = re.compile(r"\b(can you|could you|would you|please|need you to|action required|please review|let me know|follow up|send|approve|confirm|reply)\b", re.I)
+DEADLINE_RE = re.compile(r"\b(today|tonight|tomorrow|eod|end of day|asap|urgent|by \d{1,2}(?::\d{2})?\s?(?:am|pm)?)\b", re.I)
 BLOCKER_RE = re.compile(r"\b(blocked|blocker|blocking|can't proceed|cannot proceed|production down|outage|critical|sev[ -]?1)\b", re.I)
-DECISION_RE = re.compile(r"\b(approve|approval|decision|sign off|sign-off)\b", re.I)
-FYI_RE = re.compile(r"^\s*(fyi|for your information)\b", re.I)
-NEGATED_URGENCY_RE = re.compile(r"\b(?:not|no|isn't|is not|never|without)\s+(?:an?\s+)?(?:urgent|asap|critical|emergency)\b", re.I)
-P0_RE = re.compile(r"\b(production down|sev[ -]?1|critical outage)\b", re.I)
 
 WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
 WEEKDAY_RE = re.compile(r"\b(?:by|before|on|until|this|next|every)\s+(" + "|".join(WEEKDAYS) + r")\b", re.I)
 CLOCK_RE = re.compile(r"\b(?:by|at|before|until|@)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
 MEETING_RE = re.compile(r"\b(meet|meeting|sync|schedule|calendar|call|huddle|catch[ -]?up|let'?s talk|standup|stand-up|1:1|one-on-one)\b", re.I)
-INVITE_DATE_RE = re.compile(
-    r"\b(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)[, ]+)?"
-    r"(january|february|march|april|may|june|july|august|september|october|november|december)"
-    r"\s+(\d{1,2})(?:,?\s+(\d{4}))?\b",
-    re.I,
-)
-TIME_RANGE_RE = re.compile(
-    r"\b(?P<start>\d{1,2})(?::(?P<start_min>\d{2}))?\s*(?P<start_meridiem>am|pm)?"
-    r"\s*(?:-|–|—|to)\s*"
-    r"(?P<end>\d{1,2})(?::(?P<end_min>\d{2}))?\s*(?P<end_meridiem>am|pm)\b",
-    re.I,
-)
 
 
 def get_tz(name: str | None = None):
@@ -51,43 +33,45 @@ def get_tz(name: str | None = None):
     return timezone.utc  # tzdata missing (common on Windows): `pip install tzdata`
 
 
-def score_message(text: str, created_at=None, *, is_dm: bool = False, mentions_me: bool = False,
-                  broadcast: bool = False, is_bot: bool = False):
-    normalized = (text or "").strip()
-    score, reasons = 10, []
-    negated = bool(NEGATED_URGENCY_RE.search(normalized))
-    scrubbed = NEGATED_URGENCY_RE.sub(" ", normalized)
-    if REQUEST_RE.search(scrubbed):
-        score += 20; reasons.append("direct request/action language")
-    if DEADLINE_RE.search(scrubbed):
-        score += 25; reasons.append("deadline/urgency language")
-    if BLOCKER_RE.search(scrubbed):
-        score += 25; reasons.append("blocker/incident language")
-    if DECISION_RE.search(scrubbed):
-        score += 10; reasons.append("decision or approval needed")
-    if MEETING_RE.search(scrubbed):
-        score += 30; reasons.append("meeting or scheduled-time language")
-    if MEETING_RE.search(scrubbed) and INVITE_DATE_RE.search(scrubbed) and TIME_RANGE_RE.search(scrubbed):
-        score += 35; reasons.append("dated calendar invitation")
-    if mentions_me:
-        score += 15; reasons.append("mentions you directly")
-    if is_dm:
-        score += 10; reasons.append("direct message to you")
-    if broadcast:
-        score += 5; reasons.append("@channel/@here broadcast")
-    if FYI_RE.search(normalized):
-        score -= 10; reasons.append("FYI phrasing")
-    if negated:
-        reasons.append("explicitly not urgent")
+def score_structural(*, is_dm: bool = False, mentions_me: bool = False, broadcast: bool = False,
+                     is_bot: bool = False, is_self: bool = False, reply_count: int = 0,
+                     has_attachment: bool = False):
+    """Fixed-weight linear score over source structure, with no text or keyword features."""
     if is_bot:
-        score -= 5; reasons.append("automated message")
-    if len(normalized) < 8:
-        score -= 10; reasons.append("very short message")
+        return 0, "P3", "automated sender filtered from ranking"
+    if is_self:
+        return 0, "P3", "outgoing message; commitment extraction is handled separately"
+
+    score, reasons = 10, ["baseline"]
+    if mentions_me:
+        score += 50
+        reasons.append("directly addressed to you")
+    if is_dm:
+        score += 20
+        reasons.append("direct message")
+    if has_attachment:
+        score += 5
+        reasons.append("contains an attachment")
+    active_replies = min(max(int(reply_count or 0), 0), 3)
+    if active_replies:
+        score += active_replies * 2
+        reasons.append("active thread")
+    if broadcast and not mentions_me:
+        score -= 5
+        reasons.append("broad-channel broadcast")
+
     score = max(0, min(100, score))
-    if P0_RE.search(scrubbed) and BLOCKER_RE.search(scrubbed):
-        return max(score, 90), "P0", "; ".join(reasons + ["explicit critical incident signal"])
-    label = "P1" if score >= 65 else "P2" if score >= 35 else "P3"
-    return score, label, "; ".join(reasons) if reasons else "no strong action signals; baseline priority"
+    label = "P0" if score >= 90 else "P1" if score >= 60 else "P2" if score >= 30 else "P3"
+    return score, label, "; ".join(reasons)
+
+
+def score_message(text: str = "", created_at=None, *, is_dm: bool = False, mentions_me: bool = False,
+                  broadcast: bool = False, is_bot: bool = False, is_self: bool = False,
+                  reply_count: int = 0, has_attachment: bool = False):
+    """Compatibility entry point; `text` and `created_at` are intentionally not scoring inputs."""
+    del text, created_at
+    return score_structural(is_dm=is_dm, mentions_me=mentions_me, broadcast=broadcast, is_bot=is_bot,
+                            is_self=is_self, reply_count=reply_count, has_attachment=has_attachment)
 
 
 def _parse_clock(low: str):
@@ -154,44 +138,6 @@ def extract_meeting_suggestion(text: str, now=None, tz=None):
     now = now or datetime.now(timezone.utc)
     tz = tz or get_tz()
     title = (text or "").strip()[:180] or "Meeting suggestion"
-    low = (text or "").lower()
-    local_now = now.astimezone(tz)
-    date_match = INVITE_DATE_RE.search(text or "")
-    range_match = TIME_RANGE_RE.search(text or "")
-    if date_match and range_match:
-        try:
-            month = datetime.strptime(date_match.group(1)[:3].title(), "%b").month
-            day = int(date_match.group(2))
-            year = int(date_match.group(3) or local_now.year)
-            event_day = date(year, month, day)
-            start_hour = int(range_match.group("start"))
-            start_minute = int(range_match.group("start_min") or 0)
-            meridiem = (range_match.group("start_meridiem") or range_match.group("end_meridiem")).lower()
-            if not 1 <= start_hour <= 12 or start_minute > 59:
-                raise ValueError("Invalid meeting time")
-            if meridiem == "pm" and start_hour < 12:
-                start_hour += 12
-            elif meridiem == "am" and start_hour == 12:
-                start_hour = 0
-            start = datetime.combine(event_day, time(start_hour, start_minute), tzinfo=tz)
-            return title, start.astimezone(timezone.utc), False
-        except ValueError:
-            pass
-    clock_match = CLOCK_RE.search(low)
-    if clock_match and not clock_match.group(3):
-        hour, minute = int(clock_match.group(1)), int(clock_match.group(2) or 0)
-        if minute <= 59 and hour <= 12:
-            local_now = now.astimezone(tz)
-            day, _ = _target_day(low, local_now.date())
-            candidate_day = day or local_now.date()
-            hours = [hour]
-            if 1 <= hour < 12:
-                hours.append(hour + 12)
-            candidates = [datetime.combine(candidate_day, time(h, minute), tzinfo=tz) for h in hours]
-            start = min((candidate for candidate in candidates if candidate > local_now), default=None)
-            if start is None:
-                start = datetime.combine(candidate_day + timedelta(days=1), time(min(hours), minute), tzinfo=tz)
-            return title, start.astimezone(timezone.utc), True
     start, explicit = extract_due(text, now, tz, default_hours={"today": 14, "tomorrow": 14, "weekday": 14})
     if start is not None:
         return title, start, not explicit

@@ -11,11 +11,11 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import pipeline_events, projects
 from app.cache import invalidate_user_caches
-from app.jobs import SLACK_EVENT, schedule_discovery
-from app.trace import log_event
-from app.models import EventReceipt, ProcessingJob, SlackConnection, SlackConversation, utcnow
-from app.pipeline import apply_deletion, index_rows, ingest_message
+from app.jobs import SLACK_EVENT
+from app.models import EventReceipt, ProcessingJob, Reminder, SlackConnection, SlackConversation, SuggestedEvent, utcnow
+from app.pipeline import apply_deletion, index_rows, ingest_message, link_and_log
 from app.slack_client import SlackClient
 from app.slack_oauth import get_token, wipe_tokens
 from app.slack_sync import ensure_users, enqueue_message
@@ -35,12 +35,11 @@ def accept_event(db: Session, payload: dict[str, Any]) -> dict:
     try:
         db.add(EventReceipt(event_id=event_id, team_id=team_id, event_type=etype))
         db.add(ProcessingJob(job_type=SLACK_EVENT, payload_json=json.dumps(payload), status="queued", team_id=team_id))
-        log_event(db, "event_received", "ok", f"{etype} accepted: receipt + job in one transaction", team_id=team_id)
+        pipeline_events.record(db, "received", "ok", team_id=team_id, trace_id=event_id, detail=f"{etype}: signature verified, receipt stored")
+        pipeline_events.record(db, "queued", "ok", team_id=team_id, trace_id=event_id, detail="durable job written in the same transaction as the receipt")
         db.commit()
     except IntegrityError:
         db.rollback()
-        log_event(db, "event_received", "duplicate", f"{etype} redelivery dropped (event_id already received)", team_id=team_id)
-        db.commit()
         return {"ok": True, "duplicate": True}
     return {"ok": True, "queued": True, "event_id": event_id}
 
@@ -102,9 +101,11 @@ def process_slack_event(db: Session, payload: dict[str, Any]) -> dict:
         job = enqueue_message(db, conn, channel_id, op, message=message, ts=ts, channel_type=channel_type, event_id=payload.get("event_id"))
         queued += job is not None
         conn.last_event_at = utcnow()
-        log_event(db, "fanout", "ok", f"{op} for channel {channel_id} routed to this user's connection", owner_id=conn.owner_id)
+        pipeline_events.record(db, "fanned_out", "ok" if job is not None else "skipped", owner_id=conn.owner_id, team_id=team_id,
+                               trace_id=payload.get("event_id"), detail=f"{op} -> {conn.team_name or conn.team_id} member job" + ("" if job is not None else " (already in flight)"))
     if not targets:
-        log_event(db, "fanout", "skipped", f"no connected member of {channel_id}", team_id=team_id)
+        pipeline_events.record(db, "fanned_out", "skipped", team_id=team_id, trace_id=payload.get("event_id"),
+                               detail="no connected user is a member of this conversation")
     db.commit()
     return {"fanout": len(targets), "queued": queued, "op": op}
 
@@ -129,12 +130,29 @@ def process_message_job(db: Session, payload: dict[str, Any]) -> dict:
                 log.info("name_lookup_skipped conn=%s reason=%s", conn.id, type(exc).__name__)
         res = ingest_message(db, conn, channel_id, message, conv_type=ctype,
                              source="demo" if conn.is_demo else "event", event_id=payload.get("event_id"))
+    trace = payload.get("event_id")
+    if res.message is not None and res.action in ("created", "updated", "deleted"):
+        m = res.message
+        pipeline_events.record(db, "ingested", "ok", owner_id=conn.owner_id, trace_id=trace, message_id=m.id,
+                               detail=f"{res.action} in {m.conv_type.replace('_', ' ')}: normalised, de-duplicated")
+        if res.action != "deleted":
+            pipeline_events.record(db, "scored", "ok", owner_id=conn.owner_id, trace_id=trace, message_id=m.id,
+                                   detail=f"{m.priority_label} ({m.priority_score}): {m.reason}"[:300])
+            rem = db.query(Reminder).filter_by(message_id=m.id, status="pending").first()
+            mt = db.query(SuggestedEvent).filter_by(message_id=m.id, status="suggested").first()
+            bits = ([f"reminder due {rem.due_at:%a %d %b %H:%M}"] if rem else []) + (["meeting suggestion"] if mt else [])
+            pipeline_events.record(db, "extracted", "ok" if bits else "skipped", owner_id=conn.owner_id, trace_id=trace, message_id=m.id,
+                                   detail=", ".join(bits) or "no deadline or meeting found")
     db.commit()
-    integrations = index_rows(db, [res.message]) if res.message is not None and res.action in ("created", "updated", "deleted") else {}
-    if res.action != "duplicate" and res.action != "ignored":
+    if res.message is not None and res.action in ("created", "updated", "deleted"):
         invalidate_user_caches(conn.owner_id)
-        schedule_discovery(db, conn.owner_id)
-        db.commit()
+    integrations = {}
+    if res.message is not None and res.action in ("created", "updated", "deleted"):
+        link_and_log(db, [res.message], trace_id=trace)
+        integrations = index_rows(db, [res.message], trace_id=trace)
+        if res.action == "created":
+            projects.schedule_discovery(db, conn.owner_id)
+            db.commit()
     out = {"action": res.action, "reason": res.reason}
     if res.message is not None:
         out.update({"message_id": res.message.id, "priority": res.message.priority_label, "score": res.message.priority_score})

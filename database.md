@@ -27,6 +27,7 @@ The API and worker must use the same relational database. Redis, Qdrant, and Neo
 | `users` | ContextOS email, display name, password hash, optional Google subject/avatar, account-active state, and login timestamps |
 | `user_sessions` | User/session relationship, SHA-256 hash of the random session cookie token, CSRF token, and expiration timestamps; raw cookie token is not stored |
 | `oauth_states` | Hashed, expiring, single-use OAuth state, purpose, initiating user, requested scopes, and optional PKCE verifier |
+| `google_calendar_connections` | One Calendar account per ContextOS user; Google identity, connection status, expiry, and Fernet-encrypted access/refresh tokens |
 | `rate_limits` | Database-backed request counters and login lockout windows/strikes when rate-limit handling uses the DB |
 
 ### Slack connections and imported data
@@ -39,15 +40,18 @@ The API and worker must use the same relational database. Redis, Qdrant, and Neo
 | `slack_messages` | Canonical per-owner Slack messages: normalized/raw text, team/channel/thread/author fields, timestamps, score/priority, ownership, deletion/handled state, and optional project association |
 | `event_receipts` | Slack event IDs and receipt metadata used for replay/deduplication |
 
-Slack access tokens are encrypted before being written to `slack_connections`. The encryption key is configured by `TOKEN_ENCRYPTION_KEY`; losing or changing it without a planned key rotation can make stored tokens unusable.
+Slack and Google Calendar access/refresh tokens are encrypted before being written to `slack_connections` and `google_calendar_connections`. The encryption key is configured by `TOKEN_ENCRYPTION_KEY`; losing or changing it without a planned key rotation can make stored tokens unusable.
 
 ### User-facing product data and auditing
 
 | Table | Data stored |
 |---|---|
 | `projects` | Owner-scoped project name/slug/keywords, active/archive state, message and priority counts, and summary metadata |
-| `reminders` | Reminder title, due date, status, optional source message, assigned Slack people, and automatic-extraction key |
-| `suggested_events` | Meeting title, proposed time/duration, provisional flag, source text/message, status, assignees, and extraction key |
+| `items` | Owner-scoped, user-confirmed Ledger items; title encrypted at rest, plus direction, lifecycle state, due metadata, and optimistic version |
+| `item_sources` | Exact item-to-message provenance links, including source connection; detached when a source is deleted or expires |
+| `item_events` | PII-light item/message lifecycle and ranking-feedback events; event payloads are allow-listed and exclude message text |
+| `reminders` | Manually created reminder title, due date, status, optional source message, and assigned Slack people; legacy auto-extraction keys remain for compatibility |
+| `suggested_events` | Manually created meeting suggestion title/time/duration, provisional flag, optional source message, status, and assignees; legacy extraction keys remain for compatibility |
 | `summaries` | Generated/extractive project summaries and daily briefings, provider metadata, and source message IDs |
 | `assistant_notes` | Asked question, answer, and the cited source-message IDs |
 | `outbound_actions` | Approved Slack action request/audit data, status, response/error, and idempotency key |

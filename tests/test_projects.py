@@ -1,7 +1,8 @@
 import time
 
 from app import projects
-from app.models import Project, SlackMessage
+from app.config import settings
+from app.models import Project, ProjectKeyword, SlackMessage
 from app.pipeline import ingest_message
 
 
@@ -31,6 +32,43 @@ def test_user_rename_survives_rediscovery(db, conn):
     p = db.query(Project).filter_by(slug="helios").one(); p.name, p.renamed = "Helios (Analytics)", True; db.commit()
     projects.discover(db, conn.owner_id)
     assert db.query(Project).filter_by(slug="helios").one().name == "Helios (Analytics)"
+
+
+def test_discovery_does_not_change_confirmed_project_keywords_or_score(db, conn):
+    project = Project(owner_id=conn.owner_id, name="Atlas Program", slug="atlas-program", status="confirmed", score=73)
+    db.add(project)
+    db.flush()
+    db.add(ProjectKeyword(project_id=project.id, keyword="atlas", is_primary=True))
+    for i in range(6):
+        created = time.time() - 3 * 86400 + i * 86400
+        ingest_message(db, conn, "C1", {
+            "ts": f"{created:.6f}", "user": f"U{i % 3}", "text": "We need Atlas migration review",
+        }, source="history")
+    db.commit()
+
+    projects.discover_projects(db, conn.owner_id)
+
+    db.refresh(project)
+    keywords = {keyword for (keyword,) in db.query(ProjectKeyword.keyword).filter_by(project_id=project.id).all()}
+    assert project.name == "Atlas Program"
+    assert project.status == "confirmed" and project.score == 73
+    assert keywords == {"atlas"}
+
+
+def test_discovery_honors_configured_three_message_minimum(db, conn, monkeypatch):
+    monkeypatch.setattr(settings, "project_min_messages", 3)
+    monkeypatch.setattr(settings, "project_min_days", 2)
+    for i in range(3):
+        created = time.time() - (2 - i) * 86400
+        ingest_message(db, conn, "C1", {
+            "ts": f"{created:.6f}", "user": f"U{i}", "text": "We need Atlas migration review",
+        }, source="history")
+    db.commit()
+
+    report = projects.discover_projects(db, conn.owner_id)
+
+    assert report["created"] >= 1
+    assert db.query(Project).filter_by(owner_id=conn.owner_id, status="auto").count() >= 1
 
 
 def test_discovery_keeps_multiword_project_channel_names(db, conn):

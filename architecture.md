@@ -1,160 +1,231 @@
 # ContextOS architecture
 
-This document describes the current implementation in `app/`, rather than a target design. The app is a FastAPI web/API process plus a separate worker process. The configured relational database (PostgreSQL in a normal deployment) stores accounts, Slack connections, messages, product data, pipeline traces, and durable jobs. Redis, Qdrant, and Neo4j are optional, derived/supporting stores—not replacements for the relational source of truth. See [database.md](./database.md) for the detailed storage inventory.
+How a person goes from "open the site" to "my Slack is sorted into projects with summaries", one feature at a time.
+Everything below describes what the code in `app/` actually does.
 
-## 1. Runtime components
-
-```text
-Browser (app/static/index.html, app.js, app.css)
-    │ HTTP + session cookie; CSRF header on state-changing calls
+```
+ Browser (static SPA, no inline JS)
+    │  cookie session + CSRF header
     ▼
-FastAPI (app/main.py)
-    ├── auth/account/messages/reminders/schedule/queue endpoints
-    ├── app/routes_slack.py: per-user Slack OAuth and connection endpoints
-    ├── app/routes_app.py: Today, projects, assistant, admin pipeline endpoints
-    ├── app/security.py: Host, Origin, body-size and response-header controls
-    └── Relational database (app/database.py, app/models.py; PostgreSQL in deployment)
-          ├── user-owned product records and encrypted OAuth tokens
-          ├── processing_jobs: durable queue and sync work
-          └── pipeline_events / worker_heartbeats: operational visibility
-                ▲
-                │ claim jobs, persist progress/results
-Worker (python -m app.worker)
-    ├── Slack event processing and history/reconcile jobs
-    ├── message ingestion, scoring, extraction and project discovery
-    ├── summaries, retention and periodic maintenance
-    └── optional indexing / external integrations
-
-Slack ── OAuth redirect to /integrations/slack/callback
-Slack ── signed Events API POST to /integrations/slack/events
-
-Optional services: Redis · Qdrant · Neo4j · Groq/Gemini · Google Calendar (credentials/token files)
+ FastAPI (app.main) ──────────────► PostgreSQL  ◄── source of truth AND durable job queue
+    │  Slack events / OAuth callbacks        ▲
+    │                                        │ SELECT … FOR UPDATE SKIP LOCKED
+    └──► enqueue job ───────────────────► Worker (python -m app.worker)
+                                              │  ingest → score → extract → project link → discover → summarise → retention
+                                              ├──► Redis   (rate limits, cache, progress, locks)         optional
+                                              ├──► Qdrant  (semantic search: P0–P2 messages + summaries)  optional
+                                              ├──► Neo4j   (people ↔ projects graph)                      optional
+                                              └──► LLM     (any OpenAI-compatible API, 3 usage gates)     optional
 ```
 
-## 2. Source code ownership
+PostgreSQL is the only required store. If Redis, Qdrant, Neo4j or the LLM are missing or down, the app degrades (per-process
+rate limits, no semantic search, no graph, extractive summaries) and never fails a request because of them.
 
-| Module | Responsibility |
-|---|---|
-| `app/main.py` | FastAPI setup, auth/account, Slack Events API intake, messages/replies, queue metrics, reminders, schedule, demo and reindex endpoints |
-| `app/routes_slack.py` | Slack OAuth start/callback, current user's connection listing, directory, sync, disconnect |
-| `app/routes_app.py` | Today/briefing, message actions, assistant, projects, admin pipeline and settings |
-| `app/auth.py`, `app/google_auth.py` | Session authentication, password handling, owner role, Google sign-in |
-| `app/security.py`, `app/ratelimit.py`, `app/validators.py` | HTTP security middleware, request validation, limits |
-| `app/models.py`, `app/database.py`, `migrations/` | SQLAlchemy models, DB sessions, schema migrations |
-| `app/slack_oauth.py`, `app/slack_client.py`, `app/slack_signing.py` | Slack OAuth/token lifecycle, Slack Web API requests, Events API verification |
-| `app/slack_events.py`, `app/slack_sync.py`, `app/worker.py` | Durable event/job creation, resumable sync, job execution and periodic work |
-| `app/pipeline.py`, `app/priority.py`, `app/projects.py`, `app/summaries.py` | Canonical message ingestion, scoring/extraction, project discovery, retrieval and generated summaries/answers |
-| `app/integrations.py`, `app/cache.py`, `app/trace.py` | Optional external services, caching and pipeline-event recording |
-| `app/static/` | Browser-based single-page interface |
+---
 
-## 3. Request and data flows
+## 1. Login
 
-### 3.1 Authentication and per-user access
+**Google (primary).** `/auth/google/start` creates `state`, `nonce` and a PKCE verifier, stores them in `oauth_states`
+(single use, 10 min), sets a random *binder* cookie and redirects to Google. `/auth/google/callback` checks the state is
+unused, unexpired and was issued to **this browser** (binder cookie hash), exchanges the code with the PKCE verifier over
+TLS, then validates `iss, aud, azp, exp, iat, nonce, sub, email_verified` and the email shape. The user is found by
+`google_sub`, else by email, else created. Pre-hijack defence: if the email was registered with a password but never
+verified, that password is wiped and its sessions revoked when the real owner signs in with Google. A different Google
+account claiming an already-linked email is refused.
 
-Password or Google authentication establishes a server-side `user_sessions` row. The raw random session token is sent in an HTTP-only cookie; the database stores its hash. Authenticated requests resolve the current user from that cookie. Mutating requests also need the session CSRF token in `X-CSRF-Token`.
+**Email + password (fallback, can be switched off with `ALLOW_PASSWORD_AUTH=false`).** Email must pass `auth.validate_email`
+(ASCII only, one `@`, dot-atom local part, DNS-shaped domain, alphabetic TLD) — the browser applies the same rules live so
+users see the problem before submitting. Passwords: ≥10 characters, hashed with scrypt, constant-time compare, and an
+identical error for "unknown user" and "wrong password".
 
-`ADMIN_EMAIL` assigns the deployment-owner role to a ContextOS user. Admin-only endpoints are guarded separately from regular per-user data APIs. Connecting Slack does not affect the role.
+**Rate limiting** (`app/ratelimit.py`, Redis `INCR`+TTL, in-process fallback): per-IP login and registration windows;
+per-(email, IP) failure counter that, after 5 failures, starts an exponential lock-out. A locked account refuses even the
+correct password (no oracle) and returns `retry_after`, which the UI turns into a countdown. `TRUSTED_PROXY_HOPS` selects the
+Nth-from-right `X-Forwarded-For` entry, so behind ngrok the limit sees the real visitor, and a spoofed header can't pick the key.
 
-Slack OAuth state identifies the ContextOS user who initiated the flow. On callback, the code saves the Slack connection under that user's `owner_id`, keyed by `(owner_id, team_id)`. The connection-list endpoint filters by that owner. The Slack consent screen still uses the Slack account/workspace available in the browser; ContextOS does not select a workspace by email.
+**Sessions.** A random token is stored only as a hash; new token on every login (no fixation); `HttpOnly`, `SameSite=Lax`,
+`Secure` on https; capped per user (`MAX_SESSIONS_PER_USER`, oldest dropped). Writes require the `X-CSRF-Token` header **and**
+a same-origin `Origin`. Every authenticated call also passes a per-user API limit.
 
-### 3.2 Slack OAuth and authorization
+## 2. Connecting Slack and choosing permissions
 
-```text
-Signed-in browser
-  GET /integrations/slack/connect?preset=...&reply=...
-    → create single-use, expiring OAuth state bound to ContextOS user
-    → redirect to Slack OAuth v2
-  Slack consent
-  GET /integrations/slack/callback?code=...&state=...
-    → check session and consume state
-    → exchange code with Slack
-    → encrypt/save user and optional bot tokens, scopes, Slack identity
-    → enqueue initial sync and redirect back to the app
-```
+After sign-in a user with no workspace sees onboarding with three plain-language levels (stored as
+`slack_connections.access_level`, scopes derived from `ACCESS_LEVELS` in `config.py`):
 
-The server derives requested scopes from a preset. Defaults are read-only user scopes; private conversation scopes and `chat:write` are optional. Users must still be allowed by Slack app distribution and their workspace's access policy.
-
-### 3.3 History sync and events
-
-- OAuth completion queues an initial sync; account settings can queue another sync.
-- Sync code pages through accessible conversations and history, persisting job/checkpoint progress.
-- `/integrations/slack/events` verifies the Slack signature and request timestamp. Event IDs are recorded for deduplication, and processing work is queued before returning a successful response.
-- Worker jobs use the connection, workspace, and owner context to process the data. Event fan-out and message handling are implemented in `app/slack_events.py`, `app/slack_sync.py`, and `app/worker.py`.
-
-The API process handles the request and enqueues work; the worker performs long-running sync and processing. Run both processes for live data.
-
-### 3.4 Message processing
-
-History sync, events, reconciliation, and development demo data feed into the shared ingestion pipeline. In broad strokes, it:
-
-1. Normalizes the Slack message and associates the owner/connection.
-2. Deduplicates or updates the stored message.
-3. Calculates priority and reason.
-4. Extracts reminder and schedule suggestions where applicable.
-5. Tags eligible messages with the user's projects. Automatic discovery requires recurring evidence and considers explicit project/channel names plus repeated structured title prefixes; users can also search stored messages by keyword and create a project manually from the Projects page. Manual creation tags matching owner messages immediately.
-6. Commits canonical records and records pipeline events.
-7. Attempts optional vector/graph indexing after persistence.
-
-The relational database is the authoritative store. Optional indexers and LLM calls can fail independently; their status is surfaced through pipeline tools and do not replace the canonical message row. Qdrant and Neo4j contain derived copies and must be treated as rebuildable indexes.
-
-Project matching uses case-insensitive keyword boundaries shared by preview, manual tagging, and live ingestion. If several active projects match, the strongest and most specific phrase wins; equally strong matches remain unassigned to avoid arbitrary project filters. Manual search only searches already-synced Slack messages and does not trigger a Slack history import.
-
-Calendar-style Slack messages with an explicit date and time range are parsed into non-provisional suggestions. Today's events appear with today's reminders on the Today view, while linked event messages are discoverable in the inbox and Ask results. Repeated identical event suggestions are deduplicated in schedule read models.
-
-### 3.5 Worker queue
-
-`processing_jobs` is a relational-database-backed queue. The worker claims available jobs, dispatches by job type, persists completion/failure and retry scheduling, and periodically records a heartbeat. Job types include Slack event handling, history sync/reconciliation, project discovery, summaries, and retention. Queue and heartbeat details are implementation-specific; consult `app/worker.py` and `app/jobs.py` for the exact behavior.
-
-### 3.6 Optional integrations
-
-| Service | Current role | Core behavior without it |
+| Level | What it can read | Slack scopes |
 |---|---|---|
-| Redis | Cache and optional rate-limit backend | Code has fallback behavior; exact mode depends on configuration |
-| Qdrant | Semantic message indexing/retrieval | SQL/keyword retrieval remains available |
-| Neo4j | People/project/channel graph queries | Graph-backed views may report unavailable; PostgreSQL records remain |
-| Groq/Gemini | LLM summaries, drafts, and answers | Non-LLM fallback behavior is available |
-| Google Calendar | Optional approved-event creation | Suggestions can still be stored and approved without calendar creation |
+| Public channels only (`essential`) | public channels the user is in | `channels:*`, `users:read` |
+| All my conversations, read-only (`recommended`, default) | + private channels, DMs, group DMs | + `groups:*`, `im:*`, `mpim:*` |
+| + replies I approve (`with_replies`) | same | + `chat:write` |
 
-Not all integrations are required or enabled by default. Their availability depends on `.env` and installed optional dependencies.
+Users start light and can upgrade later in Settings (re-consent). The flow: `/integrations/slack/connect?level=` →
+state row → Slack → `/callback` → state consumed, token exchanged, **encrypted with Fernet** and saved → initial sync queued.
+The callback verifies the Slack identity doesn't collide with another ContextOS account. Disconnect revokes the token at
+Slack and optionally erases imported messages; "delete my account" (`DELETE /api/account`, email confirmation) does the same
+for everything.
 
-## 4. Persistence and ownership
+### 2b. Connecting Gmail (second source)
 
-Principal model groups include:
+Settings / onboarding → "Connect Gmail" → `/integrations/gmail/connect` → Google consent for **`gmail.readonly` only**
+(`access_type=offline`, state bound to the signed-in user, single use) → `/integrations/gmail/callback` → the refresh and
+access tokens are Fernet-encrypted. A Gmail account is stored as a `slack_connections` row with `provider='gmail'`
+(`team_id = gmail:<address>`), so status, sync, disconnect (revokes at Google), purge, retention and account deletion are shared
+code. Add `<PUBLIC_BASE_URL>/integrations/gmail/callback` as a second redirect URI in the Google OAuth client and enable the Gmail API.
 
-- Accounts and security: `users`, `user_sessions`, `oauth_states`, and `rate_limits`.
-- Slack: `slack_connections`, `slack_conversations`, `slack_users`, `slack_messages`, and `event_receipts`.
-- Product data: `projects`, `reminders`, `suggested_events`, `summaries`, `assistant_notes`, and `outbound_actions`.
-- Operations: `processing_jobs`, `pipeline_events`, and `worker_heartbeats`.
+Sync (`gmail.py`): `messages.list` with `-category:promotions/social/forums -in:spam -in:trash after:<date>` (first run 14 days;
+later runs resume from the last finish minus 6 h, idempotent), `messages.get(format=full)`, capped at 400 per run. Each email
+maps to the Slack shape: thread → conversation (name = subject, `conv_type='email'`), message → row with a `slack_ts` derived
+from Gmail's `internalDate` + id hash. Quoted replies/signatures are trimmed. Priority: an email addressed **To me** by a human
+counts like an @mention; anything with `List-Unsubscribe`/`Precedence: bulk` or a no-reply style sender is treated as automated
+(lower score). Email is read-only: the reply endpoint refuses it. Expired/revoked access marks the connection `needs_reauth`.
 
-User-generated records include an owner or are reachable through an owner-scoped Slack connection. API handlers must scope reads and writes to the authenticated user. Slack assignee IDs are checked against connected workspaces before assignment.
+**Cross-app projects.** Discovery and linking already work on all of a user's messages regardless of source, so "Phoenix" in a
+Slack channel and "Re: Phoenix cutover" in Gmail become one project folder; summaries cite messages from both, the same person
+on both apps is merged in the People list, and the inbox defaults to *Important* (P0–P2) with All apps / Slack / Gmail filters.
 
-Redis holds only expendable cached responses and rate-limit counters. Qdrant stores semantic vectors and message payloads; Neo4j stores graph relationships used for people/project/channel views. Google Calendar OAuth credentials and tokens are filesystem files, not rows in the application database. The app may also keep project matchers in process memory for a short period.
+## 3. Ingestion: two ways in, one pipeline
 
-Schema changes belong in `migrations/`. `init_db()` may create missing tables for development, but `create_all` does not upgrade existing tables. Apply Alembic migrations when upgrading an existing database. SQLite is used by automated tests and may be used for local development, but deployment guidance assumes PostgreSQL.
+* **History sync** (`slack_sync.py`): conversations are listed, each paged with Slack's rate-limit handling (long `Retry-After`
+  waits are rescheduled instead of blocking the worker). Each page logs a `sync_page` event and updates Redis progress.
+* **Live events** (`/integrations/slack/events`): signature (HMAC + timestamp) verified → `received` event → durable job
+  (`queued`, `dedupe_key` unique while queued/processing, so Slack retries can't double-process) → worker fans the event out to
+  every connected member of that team (`fanned_out`).
 
-## 5. HTTP/API conventions and operational visibility
+`process_message` normalises the text, applies edits/deletes (a compacted message can't be resurrected by an edit), and
+upserts by (connection, channel, ts). Everything is scoped by `owner_id`.
 
-The browser calls same-origin JSON endpoints. Most authenticated endpoints use the session cookie; mutating endpoints require `X-CSRF-Token`. Errors generally return FastAPI's `detail` value, often with `code` and `message`. The full endpoint catalogue and examples are in [api.md](./api.md).
+## 4. Scoring and confirmed work
 
-The user-facing pipeline metrics and owner-only admin pipeline views are distinct:
+`priority.py` scores messages from structural signals; it does not infer a commitment from the message's wording.
+`item_ranker.py` ranks user-confirmed Ledger items with a transparent cold-start rules-only score and explanation. Its
+features and parameters are not presented as trained or calibrated. The Brief is capped at seven items. Source links are
+exact message IDs stored in `item_sources`, not probabilistic membership masks. Only actual Google Calendar events are
+shown in the Workspace schedule rail; message text does not create reminders or guessed meetings. Nothing is posted
+anywhere automatically; outbound replies still require explicit user approval.
 
-- `/api/pipeline/metrics` returns metrics scoped to the signed-in user.
-- `/api/pipeline/overview`, `/api/pipeline/events`, and `/api/admin/settings` require the configured owner.
-- `/api/pipeline/trace/{message_id}` allows access to the owner's message and permits admin-level cross-user inspection.
+## 5. Retention tiers (data lifecycle)
 
-`/docs` and `/openapi.json` are enabled only when `APP_ENV=development`.
+| Tier | Stored | Embedded (Qdrant) / graphed |
+|---|---|---|
+| P0–P2 | full text, up to `RETENTION_KEEP_DAYS` (180) | yes |
+| P3 | full text 7 days, then a ≤200-char snippet, deleted at 30 days | never |
+| Cap | `MAX_MESSAGES_PER_USER`: oldest P3, then P2, pruned; P0/P1 never | – |
 
-## 6. Reliability and security boundaries
+`retention.py` runs daily from the worker, in bounded chunks. Deleting a message also removes its project links, exact
+item-source links, and index entries; confirmed items remain while their source IDs are detached. Manually created
+reminders and schedule suggestions are kept. Table partitioning by month is the next step at
+scale and is **not implemented**.
 
-- PostgreSQL stores canonical messages and durable jobs; a worker restart should not erase queued work.
-- Slack Events API signatures and timestamps are verified before an event is accepted.
-- OAuth state is single-use, time-limited, and linked to the initiating ContextOS user.
-- Slack tokens are encrypted at rest; keep `TOKEN_ENCRYPTION_KEY` backed up and stable for existing tokens.
-- Browser mutation requests are CSRF protected and checked for an allowed Origin. Responses include security headers and API no-store behavior.
-- External service calls can fail or be rate-limited. Observe worker logs and pipeline status rather than assuming an HTTP 200 means all asynchronous work has completed.
+## 6. Projects (derived from the messages, named by what's discussed)
 
-This is not a guarantee of production readiness. In particular, validate deployment secrets, proxy trust, backups, account recovery, dependency maintenance, privacy retention, Slack scope/distribution configuration, and integration behavior in the actual deployment.
+`projects.py`, no LLM needed: candidate phrases (capitalised names, repeated bigrams, hashtags/channel names) are scored by
+messages, distinct days, authors and conversations inside a 30-day window; thresholds (`project_min_messages`, `project_min_days`)
+filter one-off chatter; overlapping candidates are merged so "Phoenix" and "Phoenix cutover" become one project named by the
+dominant term. Messages are linked through `message_projects`. Users can rename, merge, archive, create manually; archived
+projects are never re-discovered. Discovery runs after ingestion settles and every `project_discover_minutes` for users with new messages.
 
-## 7. Validate changes
+### 6b. What Qdrant and Neo4j add to the algorithm (and what happens without them)
 
-Install development dependencies and run `python -m pytest`. Use a dedicated test database and disable or isolate external services in test configuration. For frontend changes, run `node --check app/static/app.js`. Follow [README.md](./README.md) for local setup.
+| Signal | With the service | Without it |
+|---|---|---|
+| **Semantic project links** (Qdrant) | Important (P0–P2) messages no keyword caught are embedded and linked to the project whose *summary* is closest (cosine ≥ `SEMANTIC_LINK_MIN_SCORE`, default 0.50). Stored with `hits=0` so they're distinguishable; runs after discovery and after each new summary. | Keyword links only. |
+| **Assistant retrieval** (Qdrant) | Question → nearest summaries (project routing when no keyword matches) and nearest messages, always tenant-filtered and re-loaded from PostgreSQL by owner. | Keyword ranking. |
+| **Key collaborators** (Neo4j) | People who write about ≥2 projects (`Person–WROTE→Message–ABOUT→Project`) get their recent messages with some real signal (score ≥25) raised by +10, capped below P1, once, with the reason shown ("from a key collaborator"). Also powers "who to ask" and "projects that share people". | Same question answered from PostgreSQL (grouped by display name, so a person on Slack and Gmail counts once). |
+
+Project discovery also merges *facets*: a phrase whose messages are ≥60% inside a stronger project becomes an alias of it
+instead of a duplicate project.
+
+## 7. Summaries and the LLM
+
+`summaries.py` writes **versioned** summaries. Inputs: the most recent plus highest-priority messages of the project (capped);
+skipped when the input hash is unchanged or fewer than 3 new messages arrived. Each key point / open item must cite message
+ids; **uncited or invented ids are dropped**. Message text is fenced as untrusted data in the prompt. Without an LLM, or when
+rate limited, a labelled *extractive* summary is produced and upgraded automatically later.
+
+`llm.py` calls any OpenAI-compatible endpoint (Groq/Gemini free tiers are presets in `.env.example`) behind three gates:
+requests/minute (global), calls/day (global), calls/day (per user). The per-user gate is checked first so one user can't burn
+the shared quota. Failed provider calls still count (providers may bill them). Set the numbers slightly under your provider's
+console values; limits and model IDs change often and **were not verified live** here.
+
+## 8. Assistant
+
+`/assistant/ask`: detects project names in the question, retrieves matching messages (Postgres text search, plus Qdrant when
+enabled, filtered by owner and project) and project summaries, and answers with the LLM or extractively, always returning the
+source messages. Owner scoping is mandatory in every query and every vector/Cypher filter.
+
+## 9. Landing page, sample data, feature check
+
+The Assistant is the landing page: stats strip, suggested questions built from your project names, answers with sources and a
+"Who to ask" panel. With no data it offers **Load sample data** (also pinned in the sidebar in development) and Connect Slack/Gmail.
+The Pipeline page has a **Feature check** (`/api/selfcheck`): ~18 lines (worker, Slack, Gmail, scoring, reminders, projects,
+cross-app projects, summaries, LLM, citations, Qdrant vectors, semantic links, Neo4j graph counts, collaborator boost, Redis,
+events), each verified against your real rows or a real service query and marked ok / warn (on but nothing yet) / off / fail.
+
+## 9b. Pipeline page (observability) — ADMIN ONLY
+
+The Pipeline tab, `/api/pipeline/*`, `/api/selfcheck`, `/api/integrations`, `/queue/*` and a message's "Pipeline trace" are for
+administrators. Set `ADMIN_EMAILS=you@x.com,other@x.com`; in production the address must also be Google-verified, so a
+password sign-up with someone else's e-mail cannot become admin. With the list empty, in development the first account created is
+the admin; in production nobody is (startup warns). Everyone else does not see the tab and the server answers `403 admin_only`.
+Ordinary users get their own "Smart features" status and a sample-data switch in **Settings** instead.
+
+Each stage writes a row to `pipeline_events` (`login`, `slack_connected`, `received`, `queued`, `fanned_out`, `sync_page`,
+`ingested`, `scored`, `extracted`, `indexed_vector`, `indexed_graph`, `project_linked`, `summarized`, `answered`, `retention`).
+The page polls `/api/pipeline/overview` (per-layer counts, worker heartbeat, queue depth, LLM usage, service status) and
+`/api/pipeline/events?since_id=`. Clicking a message's "Pipeline trace" shows only that message's journey. Events are pruned
+after 7 days and capped per user. A demo workspace (321 messages, 5 projects, noise, edits/deletes, bot alerts) can be loaded and
+removed from this page in development.
+
+## 10. Redis, Qdrant, Neo4j (and Supabase)
+
+PostgreSQL can be Supabase: set `DATABASE_URL` to its direct (or session-pooler) string, run `alembic upgrade head`, and **enable
+RLS with no policies** on every table (Supabase can expose `public` through its REST API; ContextOS does its own auth and
+never uses that API). Migrations `0004` and `0005` fill columns missing from older schemas and make the unused legacy OAuth
+scopes column nullable without removing existing data. Avoid transaction-mode pooling for the worker (row-lock queue).
+Not tested on Supabase itself.
+Qdrant Cloud and Neo4j Aura free tiers work with `QDRANT_URL`/`QDRANT_API_KEY` and `NEO4J_URI`/`USER`/`PASSWORD`.
+
+* **Redis**: rate-limit counters, short-lived cache (hashed keys, invalidated on writes), sync progress, job locks. 15 s back-off after a failure.
+* **Qdrant**: one collection, mandatory `owner_id` filter, payload `kind` (message/summary) and `project_ids`; summaries live at point id `10¹² + project_id`.
+* **Neo4j**: `Person–WROTE→Message–ABOUT→Project`, every query constrained by owner; answers "who works on X" and "which projects share people".
+
+### 10b. What Qdrant and Neo4j do for the user (all tenant-scoped, all with a PostgreSQL fallback)
+
+| Feature (where you see it) | Engine | How it works | Without the engine |
+|---|---|---|---|
+| **Search by meaning** (Inbox search box) | Qdrant | `/api/search`: keyword hits + nearest message vectors, fused with reciprocal-rank fusion; each result is labelled *words / meaning / both*. | Word matching only |
+| **Related** button on every message | Qdrant | Nearest vectors to that message, excluding itself; flags results from the *other* app (Slack ↔ Gmail). | Other messages in the same project |
+| **Duplicate project suggestions** (Projects page) | Qdrant | Cosine similarity between project *summary* vectors ≥ `MERGE_SUGGEST_MIN_SCORE`; one click merges the smaller into the larger. | Projects sharing ≥50% of their messages |
+| **Urgency echo** (priority reason: "similar to an urgent message") | Qdrant | A recent P2/P3 message ≥ `ESCALATION_MIN_SCORE` similar to a P0/P1 one gets +`ESCALATION_BOOST`, capped below P1, once, with the reason shown. | No boost |
+| **Semantic project links**, **assistant retrieval** | Qdrant | (already described in 6b / 8) | Keyword only |
+| **People page** (connectors, projects per person, who works with whom) | Neo4j | `Person-WROTE→Message-ABOUT→Project`; "works with" = shared projects via the graph; names merged across Slack and Gmail. | Counted from PostgreSQL by display name |
+| **Single point of failure** badge on projects | Neo4j | One person wrote ≥ `DEPENDENCY_SHARE` of ≥ `DEPENDENCY_MIN_MESSAGES` messages in a project. | Same rule computed in PostgreSQL |
+| **Who to ask**, **projects sharing people**, **key-collaborator boost** | Neo4j | (already described in 6b) | PostgreSQL grouping |
+
+**Switching them on.** `docker compose up -d` starts PostgreSQL, Redis, Qdrant (6333) and Neo4j (Bolt 7687, browser 7474).
+`.env.example` already points at those addresses. Existing messages are caught up automatically: the worker enqueues an
+`index_backfill` job per user at most once an hour (it does nothing when the indexes are complete), Settings → *Smart features* →
+**Rebuild from my messages** does it on demand, and `python scripts/backfill_indexes.py [--email x] [--force-graph]` does it from
+a terminal. Neo4j gets uniqueness constraints on first write so `MERGE` stays fast. Only P0–P2 messages are embedded/graphed (P3 chatter never is).
+
+## 11. Security model (summary)
+
+CSP `script-src 'self'` (no inline script), nosniff, frame deny, `no-store` on API responses, same-origin check on writes,
+1 MB body cap, generic error bodies (no stack traces), API docs off in production, startup refuses unsafe production config
+(`production_problems()`), tokens encrypted at rest, all data rows owner-scoped, UI renders data via `textContent` only.
+
+## 12. Operations
+
+`alembic upgrade head` (0002 is idempotent and upgrades pre-Google databases in place); `python -m app.worker` must run
+(the UI warns when no heartbeat); `/health` is liveness, `/ready` checks the database. Worker handles SIGTERM gracefully.
+
+## 13. Known limits
+
+* People are matched across apps by display name only; identical names of different people would be merged in the People list.
+* Google, Gmail, Slack, the LLM provider, Qdrant and Neo4j were exercised with mocks/in-memory clients, not live accounts.
+  PostgreSQL 16 and Redis were tested for real. The v4 changes (admin gate, `intelligence.py`, People page, docker-compose) were
+  written without being able to install the dependencies or run the test suite: run `pytest` once before relying on them.
+* Docker image tags in `docker-compose.yml` were not pulled when written; use a nearby tag if one is missing.
+* The "urgency echo" and "duplicate project" thresholds are starting points. Tune them in `.env` after looking at real data.
+* Project naming is heuristic: occasionally a generic phrase ("Capacity Plan") becomes a project; archive it and it stays gone.
+* Monthly partitioning, per-user LLM budgets by plan, and email verification for password sign-ups are future work.

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, or_
 from sqlalchemy.orm import Session
 
-from app import cache, integrations, llm, projects as projects_mod, ratelimit, summaries
+from app import cache, integrations, item_events, llm, projects as projects_mod, ratelimit, summaries
 from app.auth import admin_user, current_user, is_admin
 from app.config import settings
 from app.database import get_db
@@ -113,7 +113,9 @@ def briefing(refresh: bool = False, user: User = Depends(current_user), db: Sess
 @router.post("/messages/{message_id}/handled")
 def mark_handled(message_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     row = own_message(db, user, message_id)
-    row.handled_at = utcnow(); db.commit(); cache.invalidate_user_caches(user.id)
+    row.handled_at = utcnow()
+    item_events.record_message_event(db, owner_id=user.id, message_id=row.id, event_type="act", payload={"action": "handled"})
+    db.commit(); cache.invalidate_user_caches(user.id)
     return {"ok": True}
 
 
@@ -124,7 +126,10 @@ class SnoozeIn(BaseModel):
 @router.post("/messages/{message_id}/snooze")
 def snooze(message_id: int, data: SnoozeIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     row = own_message(db, user, message_id)
-    row.snoozed_until = utcnow() + timedelta(hours=data.hours); db.commit(); cache.invalidate_user_caches(user.id)
+    row.snoozed_until = utcnow() + timedelta(hours=data.hours)
+    item_events.record_message_event(db, owner_id=user.id, message_id=row.id, event_type="snooze",
+                                    payload={"hours": data.hours})
+    db.commit(); cache.invalidate_user_caches(user.id)
     return {"ok": True, "until": row.snoozed_until.isoformat()}
 
 

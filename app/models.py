@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import (Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint)
+from sqlalchemy import (BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text,
+                        UniqueConstraint)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -23,11 +24,12 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200), default="")
-    password_hash: Mapped[str] = mapped_column(String(300))  # "!" = no password (Google-only account)
-    google_sub: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
+    password_hash: Mapped[str] = mapped_column(String(300), default="")   # "" = Google-only account (cannot password-login)
+    google_sub: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True, index=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False)  # true once Google vouched for the address
     avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    projects_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -43,17 +45,35 @@ class UserSession(Base):
 
 
 class OAuthState(Base):
-    """Single-use, short-lived OAuth state bound to the ContextOS user who started the flow."""
+    """Single-use, short-lived OAuth state. purpose='slack_connect' is bound to the signed-in user who started it;
+    purpose='google_login' has no user yet, so it is bound to the browser instead (binder cookie) + nonce + PKCE verifier."""
     __tablename__ = "oauth_states"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)  # null for google_login
-    purpose: Mapped[str] = mapped_column(String(20), default="slack_connect")  # slack_connect | google_login
-    code_verifier: Mapped[str | None] = mapped_column(String(128), nullable=True)  # PKCE
-    scopes: Mapped[str] = mapped_column(Text, default="")  # Slack scopes requested in this flow
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    purpose: Mapped[str] = mapped_column(String(30), default="slack_connect")
+    binder_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    nonce: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    code_verifier: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    payload: Mapped[str | None] = mapped_column(String(200), nullable=True)   # e.g. the chosen Slack access level
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class GoogleCalendarConnection(Base):
+    """A user's read-only Google Calendar authorization."""
+    __tablename__ = "google_calendar_connections"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    google_sub: Mapped[str] = mapped_column(String(64))
+    email: Mapped[str] = mapped_column(String(320))
+    access_token_encrypted: Mapped[str] = mapped_column(Text, default="")
+    refresh_token_encrypted: Mapped[str] = mapped_column(Text, default="")
+    access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="connected", index=True)
+    connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 # ------------------------------------------------------------------- slack ---
@@ -71,13 +91,13 @@ class SlackConnection(Base):
     user_refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     bot_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
-    requested_user_scopes: Mapped[str] = mapped_column(Text, default="")
-    slack_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     granted_user_scopes: Mapped[str] = mapped_column(Text, default="")
     granted_bot_scopes: Mapped[str] = mapped_column(Text, default="")
+    access_level: Mapped[str] = mapped_column(String(20), default="recommended")  # essential | recommended | with_replies
     # connected | needs_reauth | revoked | disconnected
     status: Mapped[str] = mapped_column(String(30), default="connected", index=True)
     is_demo: Mapped[bool] = mapped_column(Boolean, default=False)
+    provider: Mapped[str] = mapped_column(String(20), default="slack", index=True)  # slack | gmail (gmail: team_id="gmail:<addr>", slack_user_id=<addr>)
     # sync progress shown in the UI: idle | queued | running | rate_limited | error
     sync_state: Mapped[str] = mapped_column(String(20), default="idle")
     sync_total_conversations: Mapped[int] = mapped_column(Integer, default=0)
@@ -90,7 +110,6 @@ class SlackConnection(Base):
     connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-    people_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def scopes(self, kind: str = "user") -> set[str]:
         raw = self.granted_user_scopes if kind == "user" else self.granted_bot_scopes
@@ -131,8 +150,6 @@ class SlackUser(Base):
     team_id: Mapped[str] = mapped_column(String(100), index=True)
     user_id: Mapped[str] = mapped_column(String(100), index=True)
     display_name: Mapped[str] = mapped_column(String(300), default="")
-    username: Mapped[str] = mapped_column(String(100), default="")
-    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     is_bot: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -174,9 +191,6 @@ class SlackMessage(Base):
     is_bot: Mapped[bool] = mapped_column(Boolean, default=False)
     mentions_me: Mapped[bool] = mapped_column(Boolean, default=False)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
-    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source: Mapped[str] = mapped_column(String(20), default="event")   # event | history | demo
     source_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     message_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -184,6 +198,66 @@ class SlackMessage(Base):
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # Qdrant
+    compacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # retention: raw text dropped
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class Item(Base):
+    """A cross-source obligation or meeting, distinct from its source message(s)."""
+    __tablename__ = "items"
+    __table_args__ = (
+        CheckConstraint("owner_role IN ('me', 'other', 'unclear')", name="ck_items_owner_role"),
+        CheckConstraint("direction IN ('asked_of_me', 'i_promised', 'they_promised', 'i_asked')", name="ck_items_direction"),
+        CheckConstraint("state IN ('OPEN', 'ACKNOWLEDGED_PENDING', 'WAITING_ON_OTHER', 'RESOLVED', 'MUTED')", name="ck_items_state"),
+        Index("ix_item_owner_state", "owner_id", "state"),
+        Index("ix_item_owner_due", "owner_id", "due_at"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    connection_id: Mapped[int | None] = mapped_column(ForeignKey("slack_connections.id"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(30), default="commitment")  # commitment | meeting | follow_up
+    owner_role: Mapped[str] = mapped_column(String(20), default="unclear")  # me | other | unclear
+    direction: Mapped[str] = mapped_column(String(30), default="asked_of_me")  # asked_of_me | i_promised | they_promised | i_asked
+    state: Mapped[str] = mapped_column(String(30), default="OPEN", index=True)  # OPEN | ACKNOWLEDGED_PENDING | WAITING_ON_OTHER | RESOLVED | MUTED
+    title_encrypted: Mapped[str] = mapped_column(Text, default="")
+    source_message_ids: Mapped[str] = mapped_column(Text, default="[]")  # exact, sorted IDs; never a probabilistic membership mask
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    due_kind: Mapped[str] = mapped_column(String(20), default="none")  # stated | inferred | defaulted | none
+    version: Mapped[int] = mapped_column(Integer, default=1)  # optimistic-concurrency version
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ItemSource(Base):
+    """Exact source links for an item; unlike a Bloom mask, links are enumerable and deletion-safe."""
+    __tablename__ = "item_sources"
+    __table_args__ = (
+        UniqueConstraint("item_id", "message_id", name="uq_item_source_message"),
+        Index("ix_item_source_connection", "connection_id"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("slack_messages.id", ondelete="CASCADE"), index=True)
+    connection_id: Mapped[int] = mapped_column(ForeignKey("slack_connections.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ItemEvent(Base):
+    """Append-only, PII-light feedback and lifecycle events used as ranking labels."""
+    __tablename__ = "item_events"
+    __table_args__ = (
+        Index("ix_item_event_owner_time", "owner_id", "occurred_at"),
+        Index("ix_item_event_item_time", "item_id", "occurred_at"),
+        Index("ix_item_event_message_time", "message_id", "occurred_at"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="SET NULL"), nullable=True)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("slack_messages.id", ondelete="SET NULL"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)  # open | dwell | act | snooze | dismiss | external_handled | feedback
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class Reminder(Base):
@@ -192,7 +266,6 @@ class Reminder(Base):
     owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     message_id: Mapped[int | None] = mapped_column(ForeignKey("slack_messages.id"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(300))
-    assigned_people: Mapped[str] = mapped_column(Text, default="[]")
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)  # pending|completed|cancelled
     auto_key: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)  # one auto reminder per message
@@ -206,7 +279,6 @@ class SuggestedEvent(Base):
     owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     message_id: Mapped[int | None] = mapped_column(ForeignKey("slack_messages.id"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(300))
-    assigned_people: Mapped[str] = mapped_column(Text, default="[]")
     proposed_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
     is_provisional: Mapped[bool] = mapped_column(Boolean, default=False)  # time was guessed, not stated in the message
@@ -232,8 +304,8 @@ class ProcessingJob(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_type: Mapped[str] = mapped_column(String(80), index=True)
     connection_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)     # set for per-user jobs (projects, summaries)
     team_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)  # set for workspace-level slack_event jobs
-    owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)  # set for per-user jobs (discovery, summaries)
     payload_json: Mapped[str] = mapped_column(Text)
     # Unique while a job is queued/processing; cleared when it finishes. Prevents duplicate sync/message jobs.
     dedupe_key: Mapped[str | None] = mapped_column(String(200), unique=True, nullable=True)
@@ -268,66 +340,100 @@ class OutboundAction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-class RateLimit(Base):
-    """Durable counters/lockouts (login attempts, API limits). Redis is used instead when configured."""
-    __tablename__ = "rate_limits"
-    key: Mapped[str] = mapped_column(String(200), primary_key=True)
-    count: Mapped[int] = mapped_column(Integer, default=0)
-    strikes: Mapped[int] = mapped_column(Integer, default=0)
-    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
+# ---------------------------------------------------------------- projects ---
 class Project(Base):
-    """Auto-discovered from keywords that recur across the user's messages."""
+    """A topic that keeps coming up in the user's messages. status: auto | confirmed | stale | archived."""
     __tablename__ = "projects"
     __table_args__ = (UniqueConstraint("owner_id", "slug", name="uq_project_owner_slug"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    name: Mapped[str] = mapped_column(String(120))
+    name: Mapped[str] = mapped_column(String(100))
     slug: Mapped[str] = mapped_column(String(120))
-    keywords: Mapped[str] = mapped_column(Text, default="")        # comma separated, lower-case; matched with word boundaries
-    status: Mapped[str] = mapped_column(String(20), default="active")  # active | archived
-    renamed: Mapped[bool] = mapped_column(Boolean, default=False)   # user-edited names are never overwritten
-    message_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
-    p0_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="auto", index=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    channel_count: Mapped[int] = mapped_column(Integer, default=0)
+    author_count: Mapped[int] = mapped_column(Integer, default=0)
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    summary_text: Mapped[str] = mapped_column(Text, default="")
-    summary_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    summary_count: Mapped[int] = mapped_column(Integer, default=0)  # message_count when the summary was written
-    summary_source: Mapped[str] = mapped_column(String(40), default="")  # provider/model or "extractive"
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    summary_dirty: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_summary_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-class Summary(Base):
-    """Separate store for generated summaries (project summaries, daily briefings): this is what the LLM reads."""
-    __tablename__ = "summaries"
+class ProjectKeyword(Base):
+    __tablename__ = "project_keywords"
+    __table_args__ = (UniqueConstraint("project_id", "keyword", name="uq_project_keyword"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    keyword: Mapped[str] = mapped_column(String(60))
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class MessageProject(Base):
+    """Message <-> project link (a message can belong to several projects)."""
+    __tablename__ = "message_projects"
+    __table_args__ = (UniqueConstraint("message_id", "project_id", name="uq_message_project"),
+                      Index("ix_mp_project", "project_id", "message_id"))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("slack_messages.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    hits: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ProjectSummary(Base):
+    """Rolling, versioned summary. Every claim carries the message ids it came from."""
+    __tablename__ = "project_summaries"
+    __table_args__ = (UniqueConstraint("project_id", "version", name="uq_summary_version"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    summary_text: Mapped[str] = mapped_column(Text, default="")
+    key_points_json: Mapped[str] = mapped_column(Text, default="[]")
+    open_items_json: Mapped[str] = mapped_column(Text, default="[]")
+    status_label: Mapped[str] = mapped_column(String(20), default="unknown")   # on_track | at_risk | blocked | unknown
+    source_message_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    mode: Mapped[str] = mapped_column(String(20), default="extractive")        # llm | extractive
+    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    input_hash: Mapped[str] = mapped_column(String(64), default="")
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    covers_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    covers_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LlmUsage(Base):
+    """Per-user, per-day LLM call counter (the per-user cap that protects a shared free-tier quota)."""
+    __tablename__ = "llm_usage"
+    __table_args__ = (UniqueConstraint("owner_id", "day", name="uq_llm_usage_owner_day"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    kind: Mapped[str] = mapped_column(String(20), index=True)   # project | briefing
-    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
-    text: Mapped[str] = mapped_column(Text)
-    source_message_ids: Mapped[str] = mapped_column(Text, default="")
-    provider: Mapped[str] = mapped_column(String(60), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    day: Mapped[str] = mapped_column(String(10))
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
 
 
+# ---------------------------------------------------------------- pipeline ---
 class PipelineEvent(Base):
-    """Every layer a message/request passes through, shown live on the Data Pipeline page."""
+    """One row per stage a message / sync / sign-in passes through. Drives the live pipeline page."""
     __tablename__ = "pipeline_events"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    team_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
-    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    stage: Mapped[str] = mapped_column(String(30), index=True)
-    status: Mapped[str] = mapped_column(String(20), default="ok")   # ok | skipped | duplicate | error
+    __table_args__ = (Index("ix_pe_owner_id", "owner_id", "id"), Index("ix_pe_team_id", "team_id", "id"))
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    team_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    stage: Mapped[str] = mapped_column(String(40), index=True)
+    status: Mapped[str] = mapped_column(String(12), default="ok")     # ok | skipped | error
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     detail: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class WorkerHeartbeat(Base):
+    """Lets the UI say whether a worker is running, and lets the demo fall back to in-process processing if not."""
     __tablename__ = "worker_heartbeats"
-    name: Mapped[str] = mapped_column(String(80), primary_key=True)
-    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    worker_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    beat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     jobs_done: Mapped[int] = mapped_column(Integer, default=0)

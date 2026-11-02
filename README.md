@@ -1,6 +1,6 @@
 # ContextOS
 
-ContextOS is a multi-user Slack productivity application. Each person signs in to a ContextOS account, authorizes their own Slack user account, and sees their own Slack messages, reminders, projects, and schedule suggestions. The deployment owner has a separate admin view for system-wide pipeline and configuration status.
+ContextOS is a multi-user work assistant. Each person signs in to a ContextOS account, connects their own Slack, Gmail, or read-only Google Calendar, and works from a Workspace (Brief + Ask) and a Ledger of confirmed commitments, follow-ups, and meetings. The deployment owner has a separate admin view for system-wide pipeline and configuration status.
 
 The app is an actively developed MVP. Review its privacy, security, and operational requirements before exposing it to real users.
 
@@ -8,7 +8,8 @@ The app is an actively developed MVP. Review its privacy, security, and operatio
 
 - Email/password registration and sign-in, optional Google sign-in, server-side sessions, and account/session settings.
 - Per-ContextOS-user Slack OAuth connections, Slack history sync, signed Events API intake, and a PostgreSQL-backed worker queue.
-- A personal inbox, priority scores, reminders, schedule suggestions, project discovery, briefings, and an assistant with message citations.
+- A Workspace with a capped Brief, Ask with message citations, actual Calendar events, and a Ledger with owner-scoped lifecycle and source links.
+- A legacy message inbox and project/people views, reachable from Workspace; ingestion does not turn message text into unconfirmed reminders or guessed meetings.
 - Slack directory search and assignment of Slack people to reminders and schedule suggestions.
 - Optional Redis, Qdrant, Neo4j, LLM providers, and Google Calendar integration.
 - Owner-only pipeline overview, event feed, trace, and integration status.
@@ -18,7 +19,7 @@ See [explanation.md](./explanation.md) for how these pieces work, [architecture.
 ## Requirements
 
 - Python 3.11 or newer.
-- PostgreSQL (the included `docker-compose.yml` provides a local database).
+- PostgreSQL, either hosted (for example, Supabase) or installed locally. Docker is not required.
 - A Slack app with OAuth configured for workspaces you intend to support.
 - A public HTTPS tunnel or deployment URL for Slack callbacks/events during local development.
 
@@ -27,13 +28,14 @@ See [explanation.md](./explanation.md) for how these pieces work, [architecture.
 From the repository root:
 
 ```powershell
-docker compose up -d
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-Copy-Item .env.example .env
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
+
+The standard requirements install includes the Qdrant, Neo4j, MCP, and Google integration libraries. For a Docker-free setup, use your hosted Supabase PostgreSQL database and keep your hosted Qdrant and Neo4j endpoints in `.env`. Docker and the local services in `docker-compose.yml` are optional; do not run `docker compose up` when using hosted services.
 
 Set the required values in `.env` before starting:
 
@@ -43,10 +45,12 @@ Set the required values in `.env` before starting:
 - `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_SIGNING_SECRET`.
 - `TOKEN_ENCRYPTION_KEY`: generate with `python -m app.crypto`; keep it stable while encrypted tokens are stored.
 
+For Supabase, copy the PostgreSQL connection string from **Project Settings > Database** into `DATABASE_URL`. This app connects directly to PostgreSQL; the Supabase project URL and publishable API key are not database connection credentials. Keep the database password private. Run `python -m alembic upgrade head` against the configured database before starting the API and worker.
+
 Optional:
 
 - Google sign-in uses `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
-- Install `requirements-integrations.txt` for optional Qdrant, Neo4j, and MCP-related integrations.
+- Google Calendar uses the same OAuth client. Add `<PUBLIC_BASE_URL>/integrations/google-calendar/callback` as an authorised redirect URI (or set `GOOGLE_CALENDAR_REDIRECT_URI`). Each user connects their own calendar from Settings; ContextOS requests read-only access for assistant schedule lookups.
 - Configure LLM keys (`GROQ_API_KEY` and/or `GEMINI_API_KEY`) for generated answers and summaries. Without a provider, the app uses non-LLM fallbacks.
 - Redis, Qdrant, Neo4j, and Google Calendar can be left unconfigured when not used.
 

@@ -1,20 +1,48 @@
+# One command brings up everything ContextOS can use:   docker compose up -d
+# Then copy .env.example to .env (its Qdrant / Neo4j / Redis / Postgres defaults already point here) and run:
+#   uvicorn app.main:app --reload        and, in another terminal:        python -m app.worker
+# Image tags were chosen from memory and not pulled in the environment that wrote this file: if one is unavailable, use a nearby tag.
 services:
   postgres:
     image: postgres:16
-    container_name: contextos-postgres
-    restart: unless-stopped
     environment:
-      POSTGRES_DB: contextos
       POSTGRES_USER: contextos
       POSTGRES_PASSWORD: contextos_dev_password
-    ports:
-      - "5432:5432"
-    volumes:
-      - contextos_pgdata:/var/lib/postgresql/data
+      POSTGRES_DB: contextos
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U contextos -d contextos"]
+      test: ["CMD-SHELL", "pg_isready -U contextos"]
       interval: 5s
-      timeout: 3s
       retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  qdrant:                      # semantic search, related messages, merge suggestions, urgency echo
+    image: qdrant/qdrant:v1.12.5
+    ports: ["6333:6333", "6334:6334"]
+    volumes: ["qdrantdata:/qdrant/storage"]
+
+  neo4j:                       # people, who-to-ask, collaborator boost, single-point-of-failure warnings
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-contextos_neo4j_pw}
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+    ports: ["7474:7474", "7687:7687"]       # 7474 = browser UI (http://localhost:7474), 7687 = Bolt
+    volumes: ["neo4jdata:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-contextos_neo4j_pw} 'RETURN 1' || exit 1"]
+      interval: 10s
+      retries: 12
+
 volumes:
-  contextos_pgdata:
+  pgdata:
+  qdrantdata:
+  neo4jdata:

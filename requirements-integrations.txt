@@ -1,7 +1,6 @@
 qdrant-client>=1.9
 fastembed>=0.3
 neo4j>=5.20
-langgraph>=0.2
 mcp>=1.0
 google-api-python-client
 google-auth-oauthlib

@@ -17,13 +17,13 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.crypto import TokenCryptoError
-from app.jobs import (schedule_discovery, PermanentJobError, RescheduleJob, SLACK_INCREMENTAL_SYNC, SLACK_INITIAL_SYNC, SLACK_PROCESS_MESSAGE,
+from app.jobs import (PermanentJobError, RescheduleJob, SLACK_INCREMENTAL_SYNC, SLACK_INITIAL_SYNC, SLACK_PROCESS_MESSAGE,
                       SLACK_RECONCILE, enqueue_job)
 from app.models import (OutboundAction, SlackConnection, SlackConversation, SlackMessage, SlackUser, as_utc, utcnow)
-from app.pipeline import apply_deletion, get_or_create_conversation, index_rows, ingest_message
+from app import cache, projects
+from app.pipeline import apply_deletion, get_or_create_conversation, index_rows, ingest_message, link_and_log, log_batch
 from app.slack_client import (SlackApiError, SlackAuthError, SlackChannelError, SlackClient, SlackRateLimited, SlackScopeError)
 from app.slack_oauth import get_token, mark_needs_reauth
-from app.trace import log_event
 from app.slack_text import (datetime_to_ts, mentioned_user_ids, normalize_text, ts_max, ts_min, ts_to_datetime, ts_to_decimal)
 
 log = logging.getLogger("contextos.sync")
@@ -36,12 +36,16 @@ MAX_THREADS_PER_RUN = 50
 
 def syncable_types(conn: SlackConnection) -> list[str]:
     """Conversation types for which BOTH the discovery and the history scope were granted."""
+    if conn.provider == "gmail":
+        return ["email"]
     return [t for t in TYPE_ORDER if conn.has_scope(READ_SCOPE[t]) and conn.has_scope(HISTORY_SCOPE[t])]
 
 
 def missing_scopes(conn: SlackConnection) -> list[str]:
-    requested = {x for x in (conn.requested_user_scopes or "").split(",") if x}
-    return sorted(requested - conn.scopes("user"))
+    """Scopes the chosen access level needs but Slack did not grant (e.g. the workspace admin restricts some)."""
+    if conn.provider == "gmail":
+        return []
+    return sorted(set(settings.scopes_for_level(conn.access_level)) - conn.scopes("user"))
 
 
 # ------------------------------------------------------------------ queue ---
@@ -80,13 +84,11 @@ def ensure_users(db: Session, client: SlackClient, team_id: str, user_ids: set[s
     stale = utcnow() - timedelta(days=7)
     todo = [i for i in ids if i not in cached or as_utc(cached[i].updated_at) < stale][:100]
     for uid in todo:
-        display, username, email, is_bot = uid, "", None, False
+        display, is_bot = uid, False
         try:
             user = client.call("users.info", {"user": uid}).get("user") or {}
             profile = user.get("profile") or {}
             display = profile.get("display_name") or user.get("real_name") or profile.get("real_name") or user.get("name") or uid
-            username = user.get("name") or ""
-            email = profile.get("email")
             is_bot = bool(user.get("is_bot"))
         except (SlackScopeError, SlackRateLimited, SlackAuthError):
             break
@@ -95,9 +97,9 @@ def ensure_users(db: Session, client: SlackClient, team_id: str, user_ids: set[s
                 continue
         row = cached.get(uid)
         if row is None:
-            db.add(SlackUser(team_id=team_id, user_id=uid, display_name=display, username=username, email=email, is_bot=is_bot))
+            db.add(SlackUser(team_id=team_id, user_id=uid, display_name=display, is_bot=is_bot))
         else:
-            row.display_name, row.username, row.email, row.is_bot, row.updated_at = display, username, email, is_bot, utcnow()
+            row.display_name, row.is_bot, row.updated_at = display, is_bot, utcnow()
     db.commit()
 
 
@@ -209,6 +211,21 @@ def process_page(db, client, conn, conv, msgs, *, fetch_threads=True, source="hi
     return rows, created
 
 
+def _after_page(db: Session, conn: SlackConnection, conv: SlackConversation, fetched: int, rows: list, kind: str) -> None:
+    """Everything that happens AFTER a page and its checkpoint are committed: stage log, project links, vector/graph index.
+    None of it can lose a message, so none of it may fail the sync."""
+    trace = f"sync:{conn.id}:{conv.channel_id}"
+    try:
+        log_batch(db, conn, rows, fetched=fetched, trace_id=trace, label=f"{kind} #{conv.name or conv.channel_id}")
+        db.commit()
+        link_and_log(db, rows, trace_id=trace)
+        index_rows(db, rows, trace_id=trace)
+        cache.progress_set(conn.owner_id, "messages_synced", conn.messages_synced or 0)
+    except Exception:
+        db.rollback()
+        log.exception("after_page_failed channel=%s", conv.channel_id)
+
+
 def sync_conversation(db: Session, client: SlackClient, conn: SlackConnection, conv: SlackConversation,
                       on_progress: Callable[[], None] | None = None) -> int:
     """Backfill (resumable) if not complete, otherwise fetch everything newer than the high watermark."""
@@ -229,7 +246,7 @@ def sync_conversation(db: Session, client: SlackClient, conn: SlackConnection, c
             conn.messages_synced += created
             conv.last_synced_at = utcnow()
             db.commit()  # page + checkpoint are one transaction
-            index_rows(db, rows)
+            _after_page(db, conn, conv, len(msgs), rows, "backfill")
             tick()
             total += created
             fetched += len(msgs)
@@ -249,7 +266,7 @@ def sync_conversation(db: Session, client: SlackClient, conn: SlackConnection, c
         conv.messages_synced += created
         conn.messages_synced += created
         db.commit()
-        index_rows(db, rows)
+        _after_page(db, conn, conv, len(msgs), rows, "incremental")
         tick()
         total += created
     conv.high_watermark_ts, conv.last_synced_at, conv.last_error = new_top, utcnow(), None
@@ -293,7 +310,7 @@ def reconcile_conversation(db: Session, client: SlackClient, conn: SlackConnecti
                 deleted += 1
     conv.last_synced_at, conv.last_error = utcnow(), None
     db.commit()
-    index_rows(db, touched)
+    _after_page(db, conn, conv, len(seen), touched, "reconcile")
     return {"checked": len(seen), "deleted": deleted, "touched": len(touched)}
 
 
@@ -327,6 +344,9 @@ def sync_connection(db: Session, conn: SlackConnection, mode: str = "incremental
                     on_progress: Callable[[], None] | None = None, client_factory=None) -> dict:
     """Run a sync for one connection. mode: initial | incremental | reconcile."""
     tick = on_progress or (lambda: None)
+    if conn.provider == "gmail":
+        from app import gmail
+        return gmail.sync_connection(db, conn, mode, on_progress=tick)
     if conn.is_demo:
         conn.sync_state, conn.last_sync_finished_at = "idle", utcnow()
         db.commit()
@@ -362,9 +382,8 @@ def sync_connection(db: Session, conn: SlackConnection, mode: str = "incremental
             if mode == "reconcile":
                 resolve_unknown_actions(db, conn)
         conn.sync_state, conn.last_sync_finished_at = "idle", utcnow()
-        log_event(db, "sync", "ok", f"{mode}: {summary['conversations']} conversations, {summary['new_messages']} new messages, {len(summary['skipped'])} skipped",
-                  owner_id=conn.owner_id)
-        schedule_discovery(db, conn.owner_id, delay_seconds=5)
+        if summary["new_messages"] or mode == "initial":
+            projects.schedule_discovery(db, conn.owner_id, immediate=(mode == "initial"))
         db.commit()
         return summary
     except (SlackAuthError, TokenCryptoError) as exc:

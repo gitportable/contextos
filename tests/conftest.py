@@ -9,10 +9,8 @@ os.environ.setdefault("TOKEN_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("SLACK_CLIENT_ID", "cid")
 os.environ.setdefault("SLACK_CLIENT_SECRET", "secret")
 os.environ.setdefault("SLACK_SIGNING_SECRET", "signing")
-os.environ.setdefault("GOOGLE_CLIENT_ID", "gid")
-os.environ.setdefault("GOOGLE_CLIENT_SECRET", "gsecret")
-os.environ.setdefault("PUBLIC_BASE_URL", "http://localhost:8000")
-os.environ.setdefault("LLM_PROVIDER", "none")
+os.environ["REDIS_URL"] = ""
+os.environ["LLM_API_KEY"] = ""
 os.environ.setdefault("APP_TIMEZONE", "Asia/Kolkata")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -50,3 +48,11 @@ def conn(db, user):
                         granted_user_scopes="channels:history,channels:read,groups:history,groups:read,im:history,im:read,mpim:history,mpim:read,chat:write,users:read")
     db.add(c); db.commit()
     return c
+
+
+@pytest.fixture(autouse=True)
+def _clean_state():
+    from app import cache, ratelimit
+    ratelimit.reset_for_tests()
+    cache.reset_for_tests()
+    yield

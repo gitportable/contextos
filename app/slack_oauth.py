@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 import httpx
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.config import ACCESS_LEVELS, DEFAULT_ACCESS_LEVEL, settings
 from app.crypto import decrypt_token, encrypt_token
 from app.models import OAuthState, SlackConnection, User, as_utc, utcnow
 from app.slack_client import SlackAuthError
@@ -33,51 +33,31 @@ def _h(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-# Plain-language permission groups. The browser only ever names a PRESET; scopes are decided server-side.
-SCOPE_GROUPS = {
-    "read_public": ["channels:read", "channels:history"],
-    "read_dms": ["im:read", "im:history"],
-    "read_private": ["groups:read", "groups:history", "mpim:read", "mpim:history"],
-    "names": ["users:read", "users:read.email"],
-    "reply": ["chat:write"],
-}
-PRESETS = {"essentials": ["read_public", "read_dms", "names"],
-           "everything": ["read_public", "read_dms", "read_private", "names"]}
-
-
-def scopes_for(preset: str, reply: bool, keep: set[str] | None = None) -> list[str]:
-    """Read-only by default (reply is an explicit upgrade). `keep` re-requests what the user already granted."""
-    groups = list(PRESETS.get(preset, PRESETS["essentials"])) + (["reply"] if reply else [])
-    out = {sc for g in groups for sc in SCOPE_GROUPS[g]}
-    allowed = {sc for g in SCOPE_GROUPS.values() for sc in g}
-    return sorted(out | ((keep or set()) & allowed))
-
-
-def create_state(db: Session, user: User, scopes: list[str] | None = None) -> str:
+def create_state(db: Session, user: User, level: str = DEFAULT_ACCESS_LEVEL) -> str:
+    if level not in ACCESS_LEVELS:
+        raise SlackOAuthError("bad_level", "Unknown permission level.")
     raw = secrets.token_urlsafe(32)
-    db.add(OAuthState(state_hash=_h(raw), user_id=user.id, purpose="slack_connect", scopes=",".join(scopes or []),
-                      expires_at=utcnow() + STATE_TTL))
+    db.add(OAuthState(state_hash=_h(raw), user_id=user.id, purpose="slack_connect", payload=level, expires_at=utcnow() + STATE_TTL))
     db.commit()
     return raw
 
 
 def consume_state(db: Session, raw: str | None, user: User) -> str:
-    """Valid only once, only before expiry, only for the user who started the flow. Returns the requested scopes."""
+    """Valid only once, only before expiry, only for the user who started the flow. Returns the access level chosen."""
     if not raw:
         raise SlackOAuthError("missing_state")
-    row = db.query(OAuthState).filter_by(state_hash=_h(raw)).first()
-    if (not row or row.used_at is not None or as_utc(row.expires_at) <= utcnow() or row.user_id != user.id
-            or row.purpose != "slack_connect"):
+    row = db.query(OAuthState).filter_by(state_hash=_h(raw), purpose="slack_connect").first()
+    if not row or row.used_at is not None or as_utc(row.expires_at) <= utcnow() or row.user_id != user.id:
         raise SlackOAuthError("invalid_state", "OAuth state is invalid, expired, already used, or belongs to another user.")
     row.used_at = utcnow()
     db.commit()
-    return row.scopes or ""
+    return row.payload if row.payload in ACCESS_LEVELS else DEFAULT_ACCESS_LEVEL
 
 
-def build_authorize_url(state: str, scopes: list[str]) -> str:
+def build_authorize_url(state: str, level: str = DEFAULT_ACCESS_LEVEL) -> str:
     if not settings.slack_oauth_configured:
         raise SlackOAuthError("not_configured", "Set SLACK_CLIENT_ID and SLACK_CLIENT_SECRET in .env.")
-    params = {"client_id": settings.slack_client_id, "user_scope": ",".join(scopes),
+    params = {"client_id": settings.slack_client_id, "user_scope": ",".join(settings.scopes_for_level(level)),
               "redirect_uri": settings.redirect_uri, "state": state}
     if settings.bot_scope_list:
         params["scope"] = ",".join(settings.bot_scope_list)
@@ -101,7 +81,7 @@ def exchange_code(code: str, transport: httpx.BaseTransport | None = None) -> di
     return _post_token({"code": code, "redirect_uri": settings.redirect_uri}, transport)
 
 
-def save_connection(db: Session, user: User, payload: dict, requested: str = "") -> tuple[SlackConnection, bool]:
+def save_connection(db: Session, user: User, payload: dict, level: str = DEFAULT_ACCESS_LEVEL) -> tuple[SlackConnection, bool]:
     """Upsert the (user, workspace) connection from an oauth.v2.access response. Returns (connection, created)."""
     team = payload.get("team") or {}
     authed = payload.get("authed_user") or {}
@@ -109,7 +89,7 @@ def save_connection(db: Session, user: User, payload: dict, requested: str = "")
     if not team_id or not slack_user_id:
         raise SlackOAuthError("bad_response", "Slack response did not include workspace/user identity.")
     if not user_token:
-        raise SlackOAuthError("no_user_token", "Slack returned no user token. Check the user scopes in SLACK_USER_SCOPES.")
+        raise SlackOAuthError("no_user_token", "Slack returned no user token. Slack did not grant any user permissions.")
     conn = db.query(SlackConnection).filter_by(owner_id=user.id, team_id=team_id).first()
     created = conn is None
     if created:
@@ -118,6 +98,7 @@ def save_connection(db: Session, user: User, payload: dict, requested: str = "")
     elif conn.slack_user_id != slack_user_id:
         raise SlackOAuthError("identity_mismatch", "This ContextOS account is already linked to a different Slack user in that workspace.")
     conn.team_name = team.get("name") or conn.team_name
+    conn.access_level = level if level in ACCESS_LEVELS else DEFAULT_ACCESS_LEVEL
     conn.user_token_encrypted = encrypt_token(user_token)
     conn.granted_user_scopes = ",".join(sorted(s for s in (authed.get("scope") or "").split(",") if s))
     refresh, expires_in = authed.get("refresh_token"), authed.get("expires_in")
@@ -127,7 +108,6 @@ def save_connection(db: Session, user: User, payload: dict, requested: str = "")
         conn.bot_token_encrypted = encrypt_token(payload["access_token"])
         conn.bot_user_id = payload.get("bot_user_id")
         conn.granted_bot_scopes = ",".join(sorted(s for s in (payload.get("scope") or "").split(",") if s))
-    conn.requested_user_scopes = requested or conn.granted_user_scopes
     conn.status, conn.revoked_at, conn.last_sync_error = "connected", None, None
     conn.connected_at = utcnow()
     db.commit()
