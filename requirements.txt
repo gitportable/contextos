@@ -8,4 +8,8 @@ cryptography>=42
 tzdata
 alembic>=1.13
 redis>=5.0
--r requirements-integrations.txt
+qdrant-client>=1.9
+fastembed>=0.3
+neo4j>=5.20
+google-api-python-client
+google-auth-oauthlib
