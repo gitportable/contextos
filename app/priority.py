@@ -1,7 +1,9 @@
-"""Structural priority scoring and legacy text parsing.
+"""Date extraction and the language patterns the ranker uses (no LLM key required).
 
-Ranking deliberately ignores message text. The remaining regexes support existing assistant/date behavior
-until the item-extraction stage replaces those paths with confidence-aware structured extraction.
+Improvements over the MVP version:
+  * context-aware: mentions of you, DMs and @channel broadcasts change the score
+  * negation ("not urgent") does not trigger urgency
+  * due dates are computed in APP_TIMEZONE (not UTC) and understand clock times and weekdays
 """
 import re
 from datetime import date, datetime, time, timedelta, timezone
@@ -13,9 +15,13 @@ except ImportError:  # pragma: no cover
 
 from app.config import settings
 
-REQUEST_RE = re.compile(r"\b(can you|could you|would you|please|need you to|action required|please review|let me know|follow up|send|approve|confirm|reply)\b", re.I)
 DEADLINE_RE = re.compile(r"\b(today|tonight|tomorrow|eod|end of day|asap|urgent|by \d{1,2}(?::\d{2})?\s?(?:am|pm)?)\b", re.I)
+REQUEST_RE = re.compile(r"\b(can you|could you|would you|please|need you to|action required|please review|let me know|follow up|send|approve|confirm|reply)\b", re.I)
 BLOCKER_RE = re.compile(r"\b(blocked|blocker|blocking|can't proceed|cannot proceed|production down|outage|critical|sev[ -]?1)\b", re.I)
+DECISION_RE = re.compile(r"\b(approve|approval|decision|sign off|sign-off)\b", re.I)
+FYI_RE = re.compile(r"^\s*(fyi|for your information)\b", re.I)
+NEGATED_URGENCY_RE = re.compile(r"\b(?:not|no|isn't|is not|never|without)\s+(?:an?\s+)?(?:urgent|asap|critical|emergency)\b", re.I)
+P0_RE = re.compile(r"\b(production down|sev[ -]?1|critical outage)\b", re.I)
 
 WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
 WEEKDAY_RE = re.compile(r"\b(?:by|before|on|until|this|next|every)\s+(" + "|".join(WEEKDAYS) + r")\b", re.I)
@@ -33,45 +39,11 @@ def get_tz(name: str | None = None):
     return timezone.utc  # tzdata missing (common on Windows): `pip install tzdata`
 
 
-def score_structural(*, is_dm: bool = False, mentions_me: bool = False, broadcast: bool = False,
-                     is_bot: bool = False, is_self: bool = False, reply_count: int = 0,
-                     has_attachment: bool = False):
-    """Fixed-weight linear score over source structure, with no text or keyword features."""
-    if is_bot:
-        return 0, "P3", "automated sender filtered from ranking"
-    if is_self:
-        return 0, "P3", "outgoing message; commitment extraction is handled separately"
-
-    score, reasons = 10, ["baseline"]
-    if mentions_me:
-        score += 50
-        reasons.append("directly addressed to you")
-    if is_dm:
-        score += 20
-        reasons.append("direct message")
-    if has_attachment:
-        score += 5
-        reasons.append("contains an attachment")
-    active_replies = min(max(int(reply_count or 0), 0), 3)
-    if active_replies:
-        score += active_replies * 2
-        reasons.append("active thread")
-    if broadcast and not mentions_me:
-        score -= 5
-        reasons.append("broad-channel broadcast")
-
-    score = max(0, min(100, score))
-    label = "P0" if score >= 90 else "P1" if score >= 60 else "P2" if score >= 30 else "P3"
-    return score, label, "; ".join(reasons)
-
-
-def score_message(text: str = "", created_at=None, *, is_dm: bool = False, mentions_me: bool = False,
-                  broadcast: bool = False, is_bot: bool = False, is_self: bool = False,
-                  reply_count: int = 0, has_attachment: bool = False):
-    """Compatibility entry point; `text` and `created_at` are intentionally not scoring inputs."""
-    del text, created_at
-    return score_structural(is_dm=is_dm, mentions_me=mentions_me, broadcast=broadcast, is_bot=is_bot,
-                            is_self=is_self, reply_count=reply_count, has_attachment=has_attachment)
+def score_message(text: str, created_at=None, *, is_dm: bool = False, mentions_me: bool = False,
+                  broadcast: bool = False, is_bot: bool = False):
+    """(score, label, one-sentence reason). The scoring itself lives in app.ranker (Algorithm v7.4.1, rules-only mode)."""
+    from app.ranker import rank_message
+    return rank_message(text, created_at, None, is_dm=is_dm, mentions_me=mentions_me, is_bot=is_bot)
 
 
 def _parse_clock(low: str):

@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import auth, demo, integrations, intelligence
-from app.config import settings
+from app.config import Settings, settings
 from app.models import MessageProject, ProcessingJob, Project, SlackMessage, User, utcnow
 
 ORIGIN = {"Origin": "http://localhost:8000"}
@@ -31,34 +31,50 @@ def test_pipeline_endpoints_are_admin_only(db, monkeypatch):
         assert boss_user["is_admin"] is True and other_user["is_admin"] is False
         assert other.get("/auth/me").json()["user"]["is_admin"] is False
         for path in ("/api/pipeline/overview", "/api/pipeline/events", "/api/selfcheck", "/api/integrations", "/queue/summary", "/queue/jobs",
-                     "/api/pipeline/metrics", "/messages/1/journey"):
+                     "/api/pipeline/metrics", "/messages/1/journey", "/api/intelligence/status"):
             assert other.get(path).status_code == 403, path
             assert other.get(path).json()["detail"]["code"] == "admin_only"
+        assert other.post("/api/intelligence/rebuild").status_code == 403
         assert boss.get("/api/pipeline/overview").status_code == 200
         assert boss.get("/api/selfcheck").status_code == 200
-        # ordinary features stay open to everyone
-        assert other.get("/dashboard/summary").status_code == 200
+        assert boss.get("/api/intelligence/status").status_code == 200
+        # ordinary features stay open to everyone, but never show queue health or engine details to a non-admin
+        summary = other.get("/dashboard/summary")
+        assert summary.status_code == 200 and "queued_jobs" not in summary.json() and "failed_jobs" not in summary.json()
+        assert "queued_jobs" in boss.get("/dashboard/summary").json()
         assert other.get("/api/people").status_code == 200
-        assert other.get("/api/intelligence/status").status_code == 200
+        # the sign-in screen's public config reveals nothing about the server
+        public = other.get("/api/config").json()
+        assert "env" not in public and "llm_enabled" not in public
     finally:
         boss.__exit__(None, None, None)
         other.__exit__(None, None, None)
 
 
+def test_default_admin_is_the_owner_only(db, monkeypatch):
+    """Out of the box the one admin is kuch2731@gmail.com. Nobody else, and never 'whoever signed up first'."""
+    monkeypatch.undo()  # use the real default from config.py, not a value patched by another test
+    assert Settings().admin_email_set == {"kuch2731@gmail.com"}
+
+
 def test_admin_rules(db, monkeypatch):
-    a = User(email="a@example.com", name="A", password_hash="x", email_verified=False)
-    b = User(email="b@example.com", name="B", password_hash="x", email_verified=True)
-    db.add_all([a, b]); db.commit()
-    monkeypatch.setattr(settings, "admin_emails", "")
-    monkeypatch.setattr(settings, "app_env", "development")
-    assert auth.is_admin(db, a) and not auth.is_admin(db, b)          # dev: first account only
+    owner = User(email="Kuch2731@Gmail.com", name="Owner", password_hash="x", email_verified=True)
+    first = User(email="first@example.com", name="First", password_hash="x", email_verified=True)
+    unverified = User(email="boss@example.com", name="Boss", password_hash="x", email_verified=False)
+    db.add_all([owner, first, unverified]); db.commit()
+    monkeypatch.setattr(settings, "admin_emails", "kuch2731@gmail.com")
     monkeypatch.setattr(settings, "app_env", "production")
-    assert not auth.is_admin(db, a)                                     # production with no list: nobody
-    monkeypatch.setattr(settings, "admin_emails", "A@Example.com, b@example.com")
-    assert not auth.is_admin(db, a)                                     # listed but not verified: refused in production
-    assert auth.is_admin(db, b)
+    assert auth.is_admin(db, owner)                                     # case-insensitive match on the listed address
+    assert not auth.is_admin(db, first)                                 # the first account is NOT special any more
+    monkeypatch.setattr(settings, "admin_emails", "kuch2731@gmail.com, boss@example.com")
+    assert not auth.is_admin(db, unverified)                            # listed but unverified: refused in production
     monkeypatch.setattr(settings, "app_env", "development")
-    assert auth.is_admin(db, a)
+    monkeypatch.setattr(settings, "google_client_id", "gid"); monkeypatch.setattr(settings, "google_client_secret", "gsec")
+    assert not auth.is_admin(db, unverified)                            # Google is configured, so an unverified address can't be admin even in dev
+    monkeypatch.setattr(settings, "google_client_id", ""); monkeypatch.setattr(settings, "google_client_secret", "")
+    assert auth.is_admin(db, unverified)                                # local dev with no Google sign-in at all: nothing could be verified
+    monkeypatch.setattr(settings, "admin_emails", "")
+    assert not auth.is_admin(db, owner) and not auth.is_admin(db, first)  # empty list: nobody
 
 
 def test_startup_warns_when_qdrant_or_neo4j_missing(monkeypatch):
@@ -130,24 +146,6 @@ def test_related_messages_exclude_self_and_other_tenants(db, user, conn, qdrant)
     res = intelligence.related_messages(db, user, a, limit=5)
     got = {r["id"] for r in res["related"]}
     assert res["source"] == "qdrant" and b.id in got and a.id not in got and c.id not in got
-
-
-def test_related_messages_labels_project_fallback_correctly(db, user, conn, monkeypatch):
-    a = _msg(db, user, conn, "phoenix migration status", "2.4")
-    b = _msg(db, user, conn, "phoenix migration next steps", "2.5")
-    project = Project(owner_id=user.id, name="Phoenix migration", slug="phoenix-migration", status="auto")
-    db.add(project)
-    db.flush()
-    db.add_all([MessageProject(message_id=a.id, project_id=project.id, owner_id=user.id),
-                MessageProject(message_id=b.id, project_id=project.id, owner_id=user.id)])
-    db.commit()
-    monkeypatch.setattr(settings, "qdrant_url", "http://memory")
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-
-    result = intelligence.related_messages(db, user, a, limit=5)
-
-    assert result["source"] == "postgresql (same project)"
-    assert [message["id"] for message in result["related"]] == [b.id]
 
 
 def test_merge_suggestions_fallback_and_qdrant(db, user, conn, monkeypatch):
@@ -248,6 +246,8 @@ def test_search_and_people_routes(db, monkeypatch):
         assert c.get("/api/search", params={"q": "x", "source": "sms"}).status_code == 400
         assert c.get("/messages/999/related").status_code == 404
         assert c.get("/api/people/detail", params={"name": " "}).status_code == 400
+        assert c.get("/api/intelligence/status").status_code == 403       # service status is for the administrator
+        monkeypatch.setattr(settings, "admin_emails", "route@example.com")
         st = c.get("/api/intelligence/status").json()
         assert {"qdrant", "neo4j", "features"} <= set(st) and all("url" not in str(v).lower() for v in (st["qdrant"], st["neo4j"]))
         assert c.get("/api/projects/merge-suggestions").json()["suggestions"] == []

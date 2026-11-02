@@ -1,7 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import (BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text,
-                        UniqueConstraint)
+from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -199,65 +198,33 @@ class SlackMessage(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # Qdrant
     compacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # retention: raw text dropped
-    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
-class Item(Base):
-    """A cross-source obligation or meeting, distinct from its source message(s)."""
-    __tablename__ = "items"
-    __table_args__ = (
-        CheckConstraint("owner_role IN ('me', 'other', 'unclear')", name="ck_items_owner_role"),
-        CheckConstraint("direction IN ('asked_of_me', 'i_promised', 'they_promised', 'i_asked')", name="ck_items_direction"),
-        CheckConstraint("state IN ('OPEN', 'ACKNOWLEDGED_PENDING', 'WAITING_ON_OTHER', 'RESOLVED', 'MUTED')", name="ck_items_state"),
-        Index("ix_item_owner_state", "owner_id", "state"),
-        Index("ix_item_owner_due", "owner_id", "due_at"),
-    )
+class MessageState(Base):
+    """The user's own triage of one message: marked done, or snoozed until later. Kept in its own table so the (large)
+    messages table needs no migration and a re-sync never wipes what the user already dealt with."""
+    __tablename__ = "message_states"
+    __table_args__ = (UniqueConstraint("owner_id", "message_id", name="uq_message_state"),
+                      Index("ix_message_state_owner", "owner_id", "handled_at", "snoozed_until"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    connection_id: Mapped[int | None] = mapped_column(ForeignKey("slack_connections.id"), nullable=True, index=True)
-    kind: Mapped[str] = mapped_column(String(30), default="commitment")  # commitment | meeting | follow_up
-    owner_role: Mapped[str] = mapped_column(String(20), default="unclear")  # me | other | unclear
-    direction: Mapped[str] = mapped_column(String(30), default="asked_of_me")  # asked_of_me | i_promised | they_promised | i_asked
-    state: Mapped[str] = mapped_column(String(30), default="OPEN", index=True)  # OPEN | ACKNOWLEDGED_PENDING | WAITING_ON_OTHER | RESOLVED | MUTED
-    title_encrypted: Mapped[str] = mapped_column(Text, default="")
-    source_message_ids: Mapped[str] = mapped_column(Text, default="[]")  # exact, sorted IDs; never a probabilistic membership mask
-    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    due_kind: Mapped[str] = mapped_column(String(20), default="none")  # stated | inferred | defaulted | none
-    version: Mapped[int] = mapped_column(Integer, default=1)  # optimistic-concurrency version
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("slack_messages.id", ondelete="CASCADE"), index=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
-class ItemSource(Base):
-    """Exact source links for an item; unlike a Bloom mask, links are enumerable and deletion-safe."""
-    __tablename__ = "item_sources"
-    __table_args__ = (
-        UniqueConstraint("item_id", "message_id", name="uq_item_source_message"),
-        Index("ix_item_source_connection", "connection_id"),
-    )
+class MessageFeedback(Base):
+    """The user's explicit label on why a message was (not) worth their attention. The ranker learns from these from day one."""
+    __tablename__ = "message_feedback"
+    __table_args__ = (UniqueConstraint("owner_id", "message_id", name="uq_message_feedback"),
+                      Index("ix_message_feedback_owner_sender", "owner_id", "sender_key"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     message_id: Mapped[int] = mapped_column(ForeignKey("slack_messages.id", ondelete="CASCADE"), index=True)
-    connection_id: Mapped[int] = mapped_column(ForeignKey("slack_connections.id"), index=True)
+    sender_key: Mapped[str] = mapped_column(String(400))
+    label: Mapped[str] = mapped_column(String(20))   # not_urgent | wrong_person | not_mine | always_show
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
-class ItemEvent(Base):
-    """Append-only, PII-light feedback and lifecycle events used as ranking labels."""
-    __tablename__ = "item_events"
-    __table_args__ = (
-        Index("ix_item_event_owner_time", "owner_id", "occurred_at"),
-        Index("ix_item_event_item_time", "item_id", "occurred_at"),
-        Index("ix_item_event_message_time", "message_id", "occurred_at"),
-    )
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="SET NULL"), nullable=True)
-    message_id: Mapped[int | None] = mapped_column(ForeignKey("slack_messages.id", ondelete="SET NULL"), nullable=True)
-    event_type: Mapped[str] = mapped_column(String(40), index=True)  # open | dwell | act | snooze | dismiss | external_handled | feedback
-    payload_json: Mapped[str] = mapped_column(Text, default="{}")
-    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class Reminder(Base):

@@ -8,9 +8,9 @@ from sqlalchemy.orm import Session
 from app import auth, integrations
 from app.cache import invalidate_user_caches
 from app.database import get_db
-from app.models import (AssistantNote, Item, ItemEvent, ItemSource, LlmUsage, MessageProject, OAuthState, OutboundAction, PipelineEvent,
-                        ProcessingJob, Project, GoogleCalendarConnection, ProjectKeyword, ProjectSummary, Reminder,
-                        SlackConnection, SlackConversation, SlackMessage, SuggestedEvent, User, UserSession)
+from app.models import (AssistantNote, LlmUsage, MessageFeedback, MessageProject, MessageState, OAuthState, OutboundAction, PipelineEvent, ProcessingJob, Project,
+                        GoogleCalendarConnection, ProjectKeyword, ProjectSummary, Reminder, SlackConnection, SlackConversation,
+                        SlackMessage, SuggestedEvent, User, UserSession)
 from app.pipeline import purge_connection_data
 from app.slack_client import SlackClient
 from app.slack_oauth import get_token, wipe_tokens
@@ -48,15 +48,12 @@ def delete_user_data(db: Session, user: User) -> dict:
         db.query(OutboundAction).filter(OutboundAction.connection_id == conn.id).delete(synchronize_session=False)
         db.query(ProcessingJob).filter(ProcessingJob.connection_id == conn.id).delete(synchronize_session=False)
     pids = [i for (i,) in db.query(Project.id).filter_by(owner_id=user.id).all()]
-    db.query(ItemEvent).filter(ItemEvent.owner_id == user.id).delete(synchronize_session=False)
-    db.query(ItemSource).filter(ItemSource.item_id.in_(db.query(Item.id).filter(Item.owner_id == user.id))).delete(synchronize_session=False)
-    db.query(Item).filter(Item.owner_id == user.id).delete(synchronize_session=False)
     db.query(MessageProject).filter(MessageProject.owner_id == user.id).delete(synchronize_session=False)
     db.query(ProjectSummary).filter(ProjectSummary.owner_id == user.id).delete(synchronize_session=False)
     if pids:
         db.query(ProjectKeyword).filter(ProjectKeyword.project_id.in_(pids)).delete(synchronize_session=False)
     db.query(Project).filter(Project.owner_id == user.id).delete(synchronize_session=False)
-    for model in (Reminder, SuggestedEvent, AssistantNote, OutboundAction, PipelineEvent, LlmUsage, ProcessingJob):
+    for model in (MessageFeedback, MessageState, Reminder, SuggestedEvent, AssistantNote, OutboundAction, PipelineEvent, LlmUsage, ProcessingJob):
         db.query(model).filter(model.owner_id == user.id).delete(synchronize_session=False)
     db.query(SlackMessage).filter(SlackMessage.owner_id == user.id).delete(synchronize_session=False)
     db.query(SlackConversation).filter(SlackConversation.connection_id.in_(

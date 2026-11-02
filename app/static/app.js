@@ -20,7 +20,7 @@ function h(tag, props, ...kids) {
   return el;
 }
 const $ = (s, r = document) => r.querySelector(s);
-const state = { csrf: null, user: null, config: {}, tab: 'workspace', timers: [], levelsInfo: null, filter: 'important', source: '', query: '', eventCursor: 0, stageFilter: null, events: [] };
+const state = { settingsTab: 'connections', expand: false, csrf: null, user: null, config: {}, tab: 'assistant', timers: [], levelsInfo: null, filter: 'important', source: '', query: '', eventCursor: 0, stageFilter: null, events: [] };
 
 class ApiError extends Error {
   constructor(status, code, message, retryAfter) { super(message); this.status = status; this.code = code; this.retryAfter = retryAfter; }
@@ -31,10 +31,14 @@ async function api(path, { method = 'GET', body, quiet401 = false } = {}) {
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (method !== 'GET' && state.csrf) headers['X-CSRF-Token'] = state.csrf;
   let res;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 45000);  // a hung server must not freeze the page forever
   try {
-    res = await fetch(path, { method, headers, credentials: 'same-origin', body: body === undefined ? undefined : JSON.stringify(body) });
-  } catch {
-    throw new ApiError(0, 'network', "Can't reach the server. Check your connection and try again.");
+    res = await fetch(path, { method, headers, credentials: 'same-origin', signal: ctl.signal, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (e) {
+    throw new ApiError(0, 'network', e && e.name === 'AbortError' ? 'The server took too long to answer. Please try again.' : "Can't reach the server. Check your connection and try again.");
+  } finally {
+    clearTimeout(timer);
   }
   let data = null;
   try { data = await res.json(); } catch { /* empty or non-JSON */ }
@@ -46,7 +50,7 @@ async function api(path, { method = 'GET', body, quiet401 = false } = {}) {
   throw err;
 }
 
-async function streamAssistant(question, onToken, history = []) {
+async function streamAssistant(question, onToken, history = [], onSources = () => {}) {
   const headers = { Accept: 'text/event-stream', 'Content-Type': 'application/json' };
   if (state.csrf) headers['X-CSRF-Token'] = state.csrf;
   let res;
@@ -78,7 +82,9 @@ async function streamAssistant(question, onToken, history = []) {
     }
     if (!data) return;
     const payload = JSON.parse(data);
-    if (event === 'token') {
+    if (event === 'sources') {
+      if (payload && Array.isArray(payload.sources)) onSources(payload.sources);
+    } else if (event === 'token') {
       if (payload && typeof payload.text === 'string') onToken(payload.text);
     } else if (event === 'done') {
       if (payload && typeof payload === 'object') result = payload;
@@ -216,12 +222,12 @@ async function boot() {
   }
   state.user = me.user; state.csrf = me.csrf_token;
   const tab = (location.hash || '').replace('#', '');
-  if (ROUTES.includes(tab) && (tab !== 'pipeline' || state.user.is_admin)) state.tab = tab;
+  if (visibleTabs().some((t) => t[0] === tab)) state.tab = tab;
   if (flash.slack === 'connected') { state.tab = landingAfterConnect(); renderShell(); toast('Slack connected. Importing your recent messages now. They will appear in your inbox in a moment.', 7000); return; }
   if (flash.slack === 'denied' || flash.slack === 'error') { state.tab = 'settings'; renderShell(); toast(SLACK_REASONS[flash.reason] || 'Slack could not be connected. Please try again.', 8000); return; }
   if (flash.gmail === 'connected') { state.tab = landingAfterConnect(); renderShell(); toast('Gmail connected (read-only). Importing the last 14 days now.', 7000); return; }
   if (flash.gmail === 'denied' || flash.gmail === 'error') { state.tab = 'settings'; renderShell(); toast(GMAIL_REASONS[flash.reason] || 'Gmail could not be connected. Please try again.', 9000); return; }
-  if (flash.googleCalendar === 'connected') { state.tab = 'workspace'; renderShell(); toast('Google Calendar connected (read-only). Ask about today’s schedule.', 7000); return; }
+  if (flash.googleCalendar === 'connected') { state.tab = 'assistant'; renderShell(); toast('Google Calendar connected (read-only). Ask about today’s schedule.', 7000); return; }
   if (flash.googleCalendar === 'denied' || flash.googleCalendar === 'error') { state.tab = 'settings'; renderShell(); toast(CALENDAR_REASONS[flash.reason] || 'Google Calendar could not be connected. Please try again.', 9000); return; }
   if (flash.login === 'ok' && flash.isNew) toast('Welcome to ContextOS! Let’s connect your Slack.');
   renderShell();
@@ -341,23 +347,21 @@ function googleLogo() {
 }
 
 // --------------------------------------------------------------------- shell ---
-const TABS = [['ask', '✦', 'Ask'], ['inbox', '▤', 'Inbox'], ['people', '♧', 'People'], ['workspace', '◷', 'Workspace Brief'], ['settings', '⚙', 'Settings'], ['pipeline', '⇄', 'Pipeline', true]];
-const ROUTES = ['ask', 'workspace', 'inbox', 'people', 'pipeline', 'settings'];
-const ROUTE_TITLES = { ask: 'Ask', workspace: 'Workspace Brief', inbox: 'Inbox', people: 'People', pipeline: 'Pipeline', settings: 'Settings' };
+const TABS = [['assistant', '✦', 'Assistant'], ['today', '☀', 'Inbox'], ['projects', '◧', 'Projects'], ['people', '☺', 'People'], ['pipeline', '⇄', 'Pipeline', true], ['settings', '⚙', 'Settings']];
 // The Pipeline page (live stage log, queue, service status) is for administrators only; the server enforces it too.
 function visibleTabs() { return TABS.filter((t) => !t[3] || (state.user && state.user.is_admin)); }
-function landingAfterConnect() { return 'workspace'; }
+function landingAfterConnect() { return state.user && state.user.is_admin ? 'pipeline' : 'today'; }
 function renderShell() {
   clearTimers();
-  if (!ROUTES.includes(state.tab) || (state.tab === 'pipeline' && !(state.user && state.user.is_admin))) state.tab = 'workspace';
   const nav = h('nav', { class: 'nav', 'aria-label': 'Main' }, h('div', { class: 'brand' }, h('i', {}, 'C'), 'ContextOS'),
     visibleTabs().map(([id, ico, label]) => h('button', { type: 'button', 'aria-current': state.tab === id ? 'page' : null, onclick: () => go(id) }, h('span', { 'aria-hidden': 'true' }, ico), label)),
     h('div', { class: 'grow' }), h('div', { class: 'me' }, h('b', {}, state.user.name || 'Your account'), h('span', {}, state.user.email),
       h('button', { class: 'signout-link', type: 'button', onclick: signOut }, 'Sign out')));
-  const main = h('main', { class: ['workspace', 'ask'].includes(state.tab) ? 'main assistant-main' : 'main', id: 'view' });
+  const main = h('main', { class: state.tab === 'assistant' ? 'main assistant-main' : 'main', id: 'view' });
   $('#app').replaceChildren(h('div', { class: 'shell' }, nav, main));
-  document.title = `${ROUTE_TITLES[state.tab]} · ContextOS`;
-  ({ ask: viewAsk, inbox: viewToday, people: viewPeople, workspace: viewWorkspace, pipeline: viewPipeline, settings: viewSettings })[state.tab](main).catch((e) => main.replaceChildren(h('div', { class: 'banner err' }, e.message)));
+  if (!visibleTabs().some((t) => t[0] === state.tab)) state.tab = 'assistant';
+  document.title = `${TABS.find((t) => t[0] === state.tab)[2]} · ContextOS`;
+  ({ today: viewToday, projects: viewProjects, people: viewPeople, assistant: viewAssistant, pipeline: viewPipeline, settings: viewSettings })[state.tab](main).catch((e) => main.replaceChildren(h('div', { class: 'banner err' }, e.message)));
 }
 async function loadSampleData(ev) {
   const btn = ev && ev.currentTarget;
@@ -365,14 +369,14 @@ async function loadSampleData(ev) {
   try {
     const r = await api('/api/demo/seed?size=full', { method: 'POST' });
     const admin = state.user && state.user.is_admin;
-    toast(`Sample data loading: Slack + ${r.emails_ingested ?? 0} emails are being processed${admin ? '. Opening the pipeline…' : '. Give it a minute, then check Inbox and People.'}`, 6000);
-    go(admin ? 'pipeline' : 'inbox');
+    toast(`Sample data loading: Slack + ${r.emails_ingested ?? 0} emails are being processed${admin ? '. Opening the pipeline…' : '. Give it a minute, then check Inbox, Projects and People.'}`, 6000);
+    go(admin ? 'pipeline' : 'today');
   } catch (e) { toast(e.message); } finally { busy(btn, false); }
 }
 function go(tab) { state.tab = tab; location.hash = tab; renderShell(); }
 function openInbox(filter = 'all', source = '') {
   state.filter = filter; state.source = source; state.query = '';
-  go('inbox');
+  go('today');
 }
 async function signOut() {
   try {
@@ -385,23 +389,55 @@ async function signOut() {
 }
 
 function header(title, sub, ...actions) { return h('div', { class: 'top' }, h('div', {}, h('h1', {}, title), sub ? h('div', { class: 'sub' }, sub) : null), h('div', { class: 'row' }, actions)); }
-function cleanAssistantText(text) { return (text || '').replace(/\s*\[#\d+\]/g, '').replace(/\s*\[#\d*$/, '').replace(/\b(?:null\s*){2,}\b/gi, '').trim(); }
+const isAdmin = () => !!(state.user && state.user.is_admin);
+function cleanAssistantText(text) { return (text || '').replace(/\s*\[#\d*\]?/g, '').replace(/\[\d{0,2}$/, '').replace(/\bnullnull\b/gi, '').trim(); }
+function initials(name) { const p = (name || '?').replace(/[^\p{L}\p{N} ]/gu, '').trim().split(/\s+/); return ((p[0] || '?')[0] + (p.length > 1 ? p[p.length - 1][0] : '')).toUpperCase(); }
+const HUES = [12, 28, 150, 190, 215, 262, 320, 345];
+function hueFor(name) { let x = 0; for (const c of name || '') x = (x * 31 + c.charCodeAt(0)) >>> 0; return HUES[x % HUES.length]; }
+function avatar(name, size = 38) { return h('span', { class: 'avatar', 'aria-hidden': 'true', style: `width:${size}px;height:${size}px;background:hsl(${hueFor(name)} 55% 42%)` }, initials(name)); }
+/* Turn "Priya needs the deck [2]." into text + clickable numbered chips, and "- item" lines into a list. Text only, never innerHTML. */
+function richAnswer(text, sources, onCite) {
+  const chip = (n) => {
+    const src = (sources || []).find((x) => x.n === n);
+    return src ? h('button', { class: 'cite-chip', type: 'button', title: src.kind === 'summary' ? `Project: ${src.title}` : `${src.author || 'Message'} · ${src.channel_name || ''}`, 'aria-label': `Source ${n}`, onclick: () => onCite(src) }, String(n)) : null;
+  };
+  const inline = (line) => {
+    const out = []; let last = 0; const re = /\[(\d{1,2})\]/g; let m;
+    while ((m = re.exec(line))) { out.push(line.slice(last, m.index).replace(/\s+$/, '')); const c = chip(+m[1]); if (c) out.push(c); last = m.index + m[0].length; }
+    out.push(line.slice(last));
+    return out;
+  };
+  const box = h('div', { class: 'answer-text' }); let list = null;
+  for (const raw of (text || '').split('\n')) {
+    const bullet = /^\s*[-•*]\s+(.*)$/.exec(raw);
+    if (bullet) { if (!list) { list = h('ul', { class: 'answer-list' }); box.append(list); } list.append(h('li', {}, ...inline(bullet[1]))); continue; }
+    list = null;
+    if (raw.trim()) box.append(h('p', {}, ...inline(raw)));
+  }
+  return box;
+}
+function sourceCard(src, onOpen) {
+  const isSummary = src.kind === 'summary';
+  const label = isSummary ? `Project · ${src.title}` : `${src.provider === 'gmail' ? 'Gmail' : 'Slack'} · ${src.channel_name || ''}`;
+  return h('button', { class: 'source-card', type: 'button', onclick: () => onOpen(src) },
+    h('span', { class: 'source-n' }, String(src.n)), h('span', { class: 'source-body' }, h('b', {}, label), h('span', {}, `${src.author ? src.author + ': ' : ''}${(src.text || '').slice(0, 110)}`)));
+}
+function openSource(src) { if (src.kind === 'summary') projectDialog(src.project_id, () => {}); else if (src.message_id) sourceDialog(src.message_id); }
 
 // --------------------------------------------------------------------- today ---
 async function viewToday(main) {
   const [conn, dash] = await Promise.all([api('/integrations/slack/connection'), api('/dashboard/summary')]);
   if (!conn.connections.length && !dash.messages_total) return main.replaceChildren(onboarding(conn));
   const inbox = h('div', {}), side = h('div', {});
-  const refreshBtn = h('button', { class: 'btn', onclick: () => load() }, 'Refresh');
-  const workspaceBtn = h('button', { class: 'btn', type: 'button', onclick: () => go('workspace') }, 'Workspace Brief');
-  const urgentCount = dash.by_priority.P0 + dash.by_priority.P1;
+  const refreshBtn = h('button', { class: 'btn', onclick: () => { load.lastSig = null; load(); } }, 'Refresh');
+  const urgentCount = dash.urgent ?? 0;
   const summary = h('div', { class: 'attention-summary' },
     h('span', {}, `${dash.messages_total} ${dash.messages_total === 1 ? 'message' : 'messages'} in your inbox`),
     h('span', { class: 'summary-separator', 'aria-hidden': 'true' }, '·'),
-    h('button', { type: 'button', class: 'text-action', onclick: () => { state.filter = 'urgent'; load(); } }, `${urgentCount} urgent`),
+    h('button', { type: 'button', class: 'text-action', onclick: () => { state.filter = 'urgent'; state.expand = false; load(); } }, `${urgentCount} urgent`),
     h('span', { class: 'summary-separator', 'aria-hidden': 'true' }, '·'),
     h('button', { type: 'button', class: 'text-action', onclick: () => { document.querySelector('#inbox-reminders')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); } }, `${dash.pending_reminders} reminders`));
-  main.replaceChildren(header('Inbox', 'The conversations most likely to need your attention.', refreshBtn, workspaceBtn), summary, h('div', { class: 'grid2' }, inbox, side));
+  main.replaceChildren(header('Inbox', 'The conversations most likely to need your attention.', refreshBtn), summary, h('div', { class: 'grid2' }, inbox, side));
   const search = h('input', { class: 'input', type: 'search', placeholder: 'Search by words or meaning…', 'aria-label': 'Search messages', value: state.query, style: 'max-width:260px' });
   let t; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { state.query = search.value.trim(); load(); }, 300); });
   const priorityFilters = h('div', { class: 'chips' }, [['urgent', 'Urgent'], ['high', 'High'], ['normal', 'Normal'], ['all', 'Everything']].map(([p, l]) => h('button', { class: 'chip', type: 'button', 'data-f': p, 'aria-pressed': state.filter === p, onclick: () => { state.filter = p; load(); } }, l)));
@@ -437,20 +473,27 @@ async function viewToday(main) {
     resetPriority.hidden = state.filter === 'important';
     listDescription.hidden = state.filter !== 'important';
     let aw, rm, sg;
-    const qs = new URLSearchParams({ limit: state.filter === 'important' ? '4' : '60', include_self: 'true' }); if (state.filter !== 'all') qs.set('priority', state.filter); if (state.source) qs.set('source', state.source);
+    const qs = new URLSearchParams({ limit: state.filter === 'important' ? '4' : state.filter === 'urgent' && !state.expand ? '6' : '40', include_self: state.filter === 'all' ? 'true' : 'false' }); if (state.filter === 'urgent' && state.expand) qs.set('expand', 'true'); if (state.filter !== 'all') qs.set('priority', state.filter); if (state.source) qs.set('source', state.source);
     let msgs, searchNote = null;
     const calls = [api('/api/awaiting-reply'), api('/reminders'), api('/schedule/suggestions')];
     if (state.query) {
       const sq = new URLSearchParams({ q: state.query, limit: '40' }); if (state.filter !== 'all') sq.set('priority', state.filter); if (state.source) sq.set('source', state.source);
       const [sr, ...rest] = await Promise.all([api('/api/search?' + sq), ...calls]); msgs = sr.results; [aw, rm, sg] = rest;
-      searchNote = sr.semantic === 'on' ? 'Matched by words and by meaning (Qdrant).' : sr.semantic === 'no_hits' ? 'Nothing close in meaning; showing word matches.' : sr.semantic === 'off' ? 'Word matches only. Search by meaning needs Qdrant (ask your administrator).' : null;
+      searchNote = !isAdmin() ? null : sr.semantic === 'on' ? 'Matched by words and by meaning (Qdrant).' : sr.semantic === 'no_hits' ? 'Nothing close in meaning; showing word matches.' : sr.semantic === 'off' ? 'Word matches only. Search by meaning needs Qdrant (ask your administrator).' : null;
     } else {
       const [mm, ...rest] = await Promise.all([api('/messages?' + qs), ...calls]); msgs = mm; [aw, rm, sg] = rest;
     }
     if (state.query && state.filter === 'important') {
       msgs = ['P0', 'P1', 'P2', 'P3'].map((p) => msgs.find((m) => m.priority_label === p)).filter(Boolean);
     }
-    list.replaceChildren(...(searchNote ? [h('div', { class: 'search-note' }, searchNote)] : []), ...(msgs.length ? msgs.map(inboxMessageCard) : [h('div', { class: 'empty' }, state.query || state.filter !== 'important' ? 'Nothing matches those filters.' : 'You’re all caught up. New important conversations will appear here.')]));
+    const sig = JSON.stringify([msgs.map((m) => [m.id, m.more_in_conversation]), searchNote, state.expand]);
+    if (sig !== load.lastSig) {
+      load.lastSig = sig;
+      const total = msgs.length && msgs[0].urgent_total ? msgs[0].urgent_total : 0;
+      list.replaceChildren(...(searchNote ? [h('div', { class: 'search-note' }, searchNote)] : []),
+        ...(msgs.length ? msgs.map((m) => inboxMessageCard(m, load)) : [h('div', { class: 'empty' }, state.query || state.filter !== 'important' ? (state.filter === 'urgent' ? 'Nothing urgent. Enjoy the quiet.' : 'Nothing matches those filters.') : 'You’re all caught up. New important conversations will appear here.')]),
+        ...(state.filter === 'urgent' && !state.expand && total > msgs.length ? [h('button', { class: 'text-action', type: 'button', style: 'margin-top:12px', onclick: () => { state.expand = true; load(); } }, `Show all ${total} urgent conversations`)] : []));
+    }
     waitingMessages = aw;
     renderWaiting();
     rems.replaceChildren(...(rm.length ? rm.slice(0, 3).map((r) => h('div', { class: 'item' }, h('div', {}, h('div', {}, r.title.slice(0, 110)), h('div', { class: 'small muted' }, 'Due ' + when(r.due_at))),
@@ -459,22 +502,38 @@ async function viewToday(main) {
       h('button', { class: 'btn sm', onclick: async () => { await api(`/schedule/suggestions/${e.id}/approve`, { method: 'POST' }); toast('Approval recorded'); load(); } }, 'Approve'))) : [h('div', { class: 'empty small' }, 'No meeting ideas.')]));
   }
   await load();
-  every(5000, () => load().catch(() => {}));
+  every(30000, () => load().catch(() => {}));
 }
 
-function inboxMessageCard(m) {
+const FEEDBACK = { not_urgent: ['Not urgent', 'Got it: less like this will reach Urgent.'], wrong_person: ['Wrong person', 'Thanks: I’ll treat this sender as less relevant to you.'],
+  not_mine: ['Not mine', 'Thanks: I’ll treat this sender as less relevant to you.'], always_show: ['Always show', 'Pinned: this stays in Urgent until you mark it Done.'] };
+async function triage(m, kind, reload, hours, fbLabel) {
+  try {
+    const r = kind === 'feedback' ? await api(`/messages/${m.id}/feedback`, { method: 'POST', body: { label: fbLabel } })
+      : await api(`/messages/${m.id}/${kind}`, { method: 'POST', body: kind === 'snooze' ? { hours } : {} });
+    const label = kind === 'feedback' ? FEEDBACK[fbLabel][1] : kind === 'handled' ? `Cleared ${r.cleared} message${r.cleared === 1 ? '' : 's'}.` : `Snoozed for ${hours >= 24 ? 'tomorrow' : hours + ' hours'}.`;
+    const t = h('div', { class: 'toast' }, label, ' ', h('button', { class: 'toast-undo', type: 'button', onclick: async () => { t.remove(); try { await api('/messages/triage/undo', { method: 'POST', body: { ids: r.ids } }); reload.lastSig = null; reload(); } catch (e) { toast(e.message); } } }, 'Undo'));
+    $('#toasts').append(t); setTimeout(() => t.remove(), 7000);
+    reload.lastSig = null; reload();
+  } catch (e) { toast(e.message); }
+}
+function inboxMessageCard(m, reload) {
   const priorityName = { P0: 'Urgent', P1: 'High priority', P2: 'Normal', P3: 'Normal' }[m.priority_label] || 'Important';
   return h('article', { class: `inbox-message ${m.priority_label}` },
     h('div', { class: 'inbox-message-heading' },
       h('span', { class: `priority-label ${m.priority_label}` }, priorityName),
       m.is_self ? h('span', { class: 'message-context' }, 'Sent by you') : null,
       h('span', { class: 'inbox-message-meta' }, `${m.provider === 'gmail' ? 'Gmail' : 'Slack'} · ${m.author_name || m.user_id || 'Unknown'} · ${ago(m.message_created_at)}`)),
-    h('div', { class: 'inbox-message-channel' }, `${m.conv_type === 'im' || m.conv_type === 'email' ? '' : '#'}${m.channel_name}`),
+    h('div', { class: 'inbox-message-channel' }, `${m.conv_type === 'im' || m.conv_type === 'email' ? '' : '#'}${m.channel_name}`, m.more_in_conversation ? h('span', { class: 'more-pill' }, `+${m.more_in_conversation} more here`) : null),
     h('p', { class: 'inbox-message-text' }, m.text),
-    h('div', { class: 'inbox-message-footer' }, m.mentions_me ? h('span', { class: 'message-context' }, 'You were mentioned') : null,
-      h('div', { class: 'row' },
-          h('button', { class: 'text-action', type: 'button', onclick: () => addItemDialog(() => go('workspace'), m.id, m.text.slice(0, 120)) }, 'Add to Brief'),
-        h('button', { class: 'text-action', type: 'button', onclick: () => sourceDialog(m.id) }, 'View message'))));
+    m.reason ? h('p', { class: 'why-line' }, m.reason) : null,
+    h('div', { class: 'inbox-message-footer' },
+      reload ? h('details', { class: 'not-right' }, h('summary', {}, 'Not right?'),
+        h('div', { class: 'not-right-menu' }, Object.entries(FEEDBACK).map(([k, v]) => h('button', { class: 'chip', type: 'button', onclick: () => triage(m, 'feedback', reload, 0, k) }, v[0])))) : h('span', {}),
+      h('div', { class: 'row triage-actions' },
+        h('button', { class: 'text-action', type: 'button', onclick: () => sourceDialog(m.id) }, 'View'),
+        reload ? h('button', { class: 'btn sm', type: 'button', title: m.more_in_conversation ? 'Clears this whole conversation' : 'Clear this message', onclick: () => triage(m, 'handled', reload) }, '✓ Done') : null,
+        reload ? h('button', { class: 'btn sm ghost', type: 'button', onclick: () => triage(m, 'snooze', reload, 4) }, 'Snooze 4h') : null)));
 }
 
 function messageCard(m) {
@@ -500,7 +559,7 @@ function onboarding(conn) {
 
 function gmailCard(configured) {
   return h('div', { class: 'level', style: 'margin-top:12px;display:block' }, h('b', {}, '✉ Gmail (read-only)'), h('div', { class: 'muted small' }, 'Adds important emails to the same inbox and project folders. Promotions, newsletters and spam are skipped. ContextOS can never send, delete or label mail.'),
-    configured ? h('a', { class: 'btn', style: 'margin-top:8px', href: '/integrations/gmail/connect' }, 'Connect Gmail') : h('div', { class: 'banner warn' }, 'Gmail needs Google sign-in to be configured on this server (GOOGLE_CLIENT_ID / SECRET).'));
+    configured ? h('a', { class: 'btn', style: 'margin-top:8px', href: '/integrations/gmail/connect' }, 'Connect Gmail') : h('div', { class: 'banner warn' }, isAdmin() ? 'Gmail needs GOOGLE_CLIENT_ID / SECRET on the server.' : 'Gmail isn’t available yet. Ask your administrator.'));
 }
 
 async function levelPicker(box, configured, current) {
@@ -513,7 +572,7 @@ async function levelPicker(box, configured, current) {
     h('div', {}, h('b', {}, names[l.id] || l.label), l.id === info.default ? h('span', { class: 'pill ok', style: 'margin-left:8px' }, 'Recommended') : null, h('div', { class: 'muted small' }, desc[l.id]), h('div', { class: 'small muted' }, 'Slack permissions: ' + l.scopes.join(', ')))))),
     current ? null : gmailCard(state.config.google_login),
     h('ul', { class: 'never' }, h('li', {}, 'We never post, edit or delete anything unless you press Send.'), h('li', {}, 'Tokens are encrypted; you can disconnect and erase everything in one click.'), h('li', {}, 'Your messages are visible only to you.')),
-    configured ? h('a', { class: 'btn primary', style: 'margin-top:12px', href: '#', onclick: (e) => { e.preventDefault(); location.href = `/integrations/slack/connect?level=${encodeURIComponent(level)}`; } }, 'Continue to Slack') : h('div', { class: 'banner warn' }, 'Slack is not configured on this server yet (SLACK_CLIENT_ID / SLACK_CLIENT_SECRET).'));
+    configured ? h('a', { class: 'btn primary', style: 'margin-top:12px', href: '#', onclick: (e) => { e.preventDefault(); location.href = `/integrations/slack/connect?level=${encodeURIComponent(level)}`; } }, 'Continue to Slack') : h('div', { class: 'banner warn' }, isAdmin() ? 'Slack needs SLACK_CLIENT_ID / SLACK_CLIENT_SECRET on the server.' : 'Slack isn’t available yet. Ask your administrator.'));
 }
 
 // ------------------------------------------------------------- reply/journey ---
@@ -604,7 +663,7 @@ async function relatedDialog(m) {
     const body = h('div', {}, h('div', { class: 'empty' }, h('span', { class: 'spin' })));
     api(`/messages/${m.id}/related`).then((r) => body.replaceChildren(
       h('div', { class: 'msg ' + m.priority_label }, h('div', { class: 'txt' }, m.text.slice(0, 300))),
-      h('p', { class: 'small muted' }, r.source === 'qdrant' ? 'Closest in meaning, across Slack and Gmail (Qdrant).' : r.source.startsWith('postgresql') ? 'Other messages in the same project. Closeness by meaning needs Qdrant.' : ''),
+      h('p', { class: 'small muted' }, r.source === 'qdrant' ? 'Closest in meaning, across Slack and Gmail.' : 'Other messages in the same project.'),
       r.related.length ? h('div', {}, r.related.map((x) => h('div', { class: 'item' }, h('div', {}, h('div', { class: 'small muted' }, `${x.provider === 'gmail' ? '✉ Gmail' : '# Slack'} · ${x.author_name || x.user_id || 'unknown'} · ${x.channel_name} · ${ago(x.message_created_at)}${x.similarity ? ` · ${Math.round(x.similarity * 100)}% alike` : ''}`),
         h('div', {}, x.text.slice(0, 240)), x.cross_app ? h('span', { class: 'pill ok' }, 'other app') : null)))) : h('p', { class: 'muted' }, 'Nothing similar found yet.'))).catch((e) => body.replaceChildren(h('div', { class: 'banner err' }, e.message)));
     return body;
@@ -613,49 +672,71 @@ async function relatedDialog(m) {
 
 // -------------------------------------------------------------------- people ---
 async function viewPeople(main) {
-  const list = h('div', {}), note = h('div', { class: 'small muted', style: 'margin-bottom:10px' });
-  main.replaceChildren(header('People', 'Who is active across your projects and who works with whom, from your Slack and Gmail.',
-    h('button', { class: 'btn', type: 'button', onclick: () => go('workspace') }, 'Workspace Brief')), h('div', { class: 'panel' }, note, list));
+  let all = [], sort = 'active', query = '';
+  const grid = h('div', { class: 'people-grid' });
+  const search = h('input', { class: 'input', type: 'search', placeholder: 'Search people…', 'aria-label': 'Search people', oninput: () => { query = search.value.trim().toLowerCase(); draw(); } });
+  const sorts = h('div', { class: 'chips' }, [['active', 'Most recent'], ['messages', 'Most messages'], ['projects', 'Most projects'], ['name', 'A–Z']].map(([k, l]) => h('button', { class: 'chip', type: 'button', 'data-k': k, 'aria-pressed': sort === k, onclick: () => { sort = k; draw(); } }, l)));
+  const note = h('div', { class: 'small muted' });
+  main.replaceChildren(header('People', 'Everyone you talk to, and what they work on with you.'), h('div', { class: 'toolbar' }, search, sorts), note, grid);
+  function draw() {
+    sorts.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-pressed', String(c.dataset.k === sort)));
+    const rows = all.filter((p) => !query || p.name.toLowerCase().includes(query)).sort((x, y) => sort === 'name' ? x.name.localeCompare(y.name) : sort === 'projects' ? y.projects - x.projects || y.messages - x.messages : sort === 'messages' ? y.messages - x.messages : new Date(y.last_active || 0) - new Date(x.last_active || 0));
+    note.textContent = all.length ? `${rows.length} of ${all.length} people` : '';
+    grid.replaceChildren(...(rows.length ? rows.map((p) => h('button', { class: 'person-card', type: 'button', onclick: () => personDialog(p.name) },
+      avatar(p.name, 44),
+      h('div', { class: 'person-main' }, h('b', {}, p.name), p.connector ? h('span', { class: 'pill ok' }, 'Key collaborator') : null,
+        h('div', { class: 'small muted' }, p.last_active ? `Last active ${ago(p.last_active)}` : 'No recent activity'),
+        h('div', { class: 'person-stats' }, h('span', {}, `${p.messages} message${p.messages === 1 ? '' : 's'}`), h('span', {}, `${p.projects} project${p.projects === 1 ? '' : 's'}`))))) :
+      [h('div', { class: 'empty panel', style: 'grid-column:1/-1' }, all.length ? 'Nobody matches that search.' : 'No people yet. They show up once your messages are imported.')]));
+  }
   const r = await api('/api/people');
-  note.textContent = r.source === 'neo4j' ? `Relationship graph (Neo4j). “Connector” = ${r.connector_rule}.` : `Counted from your messages. Turn on Neo4j for the full relationship graph. “Connector” = ${r.connector_rule}.`;
-  list.replaceChildren(...(r.people.length ? r.people.map((p) => h('div', { class: 'item', tabindex: '0', role: 'button', style: 'cursor:pointer', onclick: () => personDialog(p.name), onkeydown: (e) => { if (e.key === 'Enter') personDialog(p.name); } },
-    h('div', {}, h('b', {}, p.name), ' ', p.connector ? h('span', { class: 'pill ok' }, 'connector') : null, h('div', { class: 'small muted' }, `${p.projects} project${p.projects === 1 ? '' : 's'} · ${p.messages} messages${p.last_active ? ' · last ' + ago(p.last_active) : ''}`)),
-    h('button', { class: 'btn sm ghost', type: 'button' }, 'Open'))) : [h('div', { class: 'empty' }, 'No people yet. They appear once messages are imported and projects are found.')]));
+  all = r.people; draw();
 }
 function personDialog(name) {
   modal(name, () => {
     const body = h('div', {}, h('div', { class: 'empty' }, h('span', { class: 'spin' })));
     api('/api/people/detail?name=' + encodeURIComponent(name)).then((d) => body.replaceChildren(
-      h('h3', {}, 'Works on'), d.projects.length ? h('div', {}, d.projects.map((p) => h('span', { class: 'kw' }, `${p.name} (${p.messages})`))) : h('p', { class: 'muted small' }, 'No project links yet.'),
-      h('h3', { style: 'margin-top:12px' }, 'Works most with'), d.works_with.length ? h('div', {}, d.works_with.map((p) => h('span', { class: 'kw' }, `${p.name} · ${p.shared_projects} shared project${p.shared_projects === 1 ? '' : 's'}`))) : h('p', { class: 'muted small' }, 'Nobody shares projects with them yet.'),
-      h('p', { class: 'small muted' }, `Projects via ${d.projects_source}, collaborators via ${d.works_with_source}.`),
-      h('h3', { style: 'margin-top:12px' }, 'Recent important messages'), d.recent.length ? h('div', {}, d.recent.map((m) => h('div', { class: 'item' }, h('div', {}, h('div', { class: 'small muted' }, `${m.provider === 'gmail' ? '✉ ' : '# '}${m.channel_name} · ${ago(m.message_created_at)} · ${m.priority_label}`), h('div', {}, m.text.slice(0, 200)))))) : h('p', { class: 'muted small' }, 'None.'))).catch((e) => body.replaceChildren(h('div', { class: 'banner err' }, e.message)));
+      h('div', { class: 'person-head' }, avatar(name, 56), h('div', {}, h('h3', {}, name), h('div', { class: 'small muted' }, `${d.projects.length} project${d.projects.length === 1 ? '' : 's'} together`))),
+      h('h3', { class: 'dlg-h' }, 'Works on'), d.projects.length ? h('div', {}, d.projects.map((p) => h('span', { class: 'kw' }, `${p.name} · ${p.messages}`))) : h('p', { class: 'muted small' }, 'No project links yet.'),
+      h('h3', { class: 'dlg-h' }, 'Works most with'), d.works_with.length ? h('div', {}, d.works_with.map((p) => h('span', { class: 'kw' }, `${p.name} · ${p.shared_projects} shared`))) : h('p', { class: 'muted small' }, 'Nobody shares projects with them yet.'),
+      isAdmin() ? h('p', { class: 'small muted' }, `Projects via ${d.projects_source}, collaborators via ${d.works_with_source}.`) : null,
+      h('h3', { class: 'dlg-h' }, 'Recent important messages'), d.recent.length ? h('div', {}, d.recent.map((m) => h('div', { class: 'item' }, h('div', {}, h('div', { class: 'small muted' }, `${m.provider === 'gmail' ? 'Gmail' : 'Slack'} · ${m.channel_name} · ${ago(m.message_created_at)}`), h('div', {}, m.text.slice(0, 200)))))) : h('p', { class: 'muted small' }, 'Nothing recent.'))).catch((e) => body.replaceChildren(h('div', { class: 'banner err' }, e.message)));
     return body;
   }, { wide: true });
 }
 
 // ------------------------------------------------------------------ projects ---
 async function viewProjects(main) {
-  const grid = h('div', { class: 'grid3' });
-  const discover = h('button', { class: 'btn', onclick: async () => { busy(discover, true, 'Queued…'); try { await api('/projects/discover', { method: 'POST' }); toast('Looking for projects. This takes a few seconds.'); setTimeout(() => { busy(discover, false); load(); }, 4000); } catch (e) { busy(discover, false); toast(e.message); } } }, 'Find projects');
+  const grid = h('div', { class: 'folder-grid' });
+  const discover = h('button', { class: 'btn', onclick: async () => { busy(discover, true, 'Searching…'); try { await api('/projects/discover', { method: 'POST' }); toast('Looking through your messages for projects…'); setTimeout(() => { busy(discover, false); load(); }, 5000); } catch (e) { busy(discover, false); toast(e.message); } } }, 'Find projects');
   const create = h('button', { class: 'btn primary', onclick: createProjectDialog }, 'New project');
   const sugg = h('div', {});
-  main.replaceChildren(header('Projects', 'Found automatically from what you keep discussing. Rename, merge or archive to teach it.', discover, create,
-    h('button', { class: 'btn', type: 'button', onclick: () => go('people') }, 'People'),
-    h('button', { class: 'btn', type: 'button', onclick: () => go('workspace') }, 'Workspace')), sugg, grid);
+  main.replaceChildren(header('Projects', 'Folders of related conversations, gathered from Slack and Gmail. Rename, merge or archive to teach it.', discover, create), sugg, grid);
+  let tries = 0;
   async function load() {
     const [ps, ms] = await Promise.all([api('/projects'), api('/api/projects/merge-suggestions').catch(() => ({ suggestions: [] }))]);
-    sugg.replaceChildren(...(ms.suggestions.length ? [h('div', { class: 'panel' }, h('h3', { style: 'margin-bottom:6px' }, 'These look like the same project'), h('div', { class: 'small muted', style: 'margin-bottom:6px' }, ms.source === 'qdrant' ? 'Found by comparing what each summary says (Qdrant).' : 'Found by comparing which messages they share.'),
+    sugg.replaceChildren(...(ms.suggestions.length ? [h('div', { class: 'panel' }, h('h3', { style: 'margin-bottom:6px' }, 'These look like the same project'),
       ms.suggestions.map((x) => h('div', { class: 'item' }, h('div', {}, h('b', {}, x.from.name), ' → ', h('b', {}, x.into.name), h('div', { class: 'small muted' }, x.why)),
         h('button', { class: 'btn sm', onclick: async (e) => { if (!confirm(`Merge “${x.from.name}” into “${x.into.name}”?`)) return; busy(e.target, true, 'Merging'); try { await api(`/projects/${x.from.id}/merge`, { method: 'POST', body: { into_id: x.into.id } }); toast('Merged'); load(); } catch (er) { busy(e.target, false); toast(er.message); } } }, 'Merge'))))] : []));
-    grid.replaceChildren(...(ps.length ? ps.map((p) => h('article', { class: 'panel pcard', tabindex: '0', role: 'button', onclick: () => projectDialog(p.id, load), onkeydown: (e) => { if (e.key === 'Enter') projectDialog(p.id, load); } },
-      h('h3', {}, p.name, p.status === 'confirmed' ? h('span', { class: 'pill ok', style: 'margin-left:8px' }, 'confirmed') : null),
-      h('div', { class: `small status-${p.health}` }, '● ' + p.health.replace('_', ' ')), p.risk ? h('div', { class: 'small', style: 'color:var(--warn)', title: 'One person wrote most of the messages in this project' }, `⚠ ${Math.round(p.risk.share * 100)}% of messages are from ${p.risk.person}`) : null, h('p', { class: 'small', style: 'min-height:48px' }, p.summary_preview || 'Summary pending…'),
-      h('div', { class: 'small muted' }, `${p.message_count} messages · ${p.channel_count} conversations · ${p.author_count} people`), h('div', {}, p.keywords.slice(0, 5).map((k) => h('span', { class: 'kw' }, k))))) :
-      [h('div', { class: 'empty panel', style: 'grid-column:1/-1' }, 'No projects yet. They appear once enough messages repeat a topic across a few days.')]));
+    const folder = (p) => h('button', { class: 'folder', type: 'button', onclick: () => projectDialog(p.id, load) },
+      h('span', { class: 'folder-tab' }),
+      h('span', { class: 'folder-body' },
+        h('span', { class: 'folder-title' }, h('b', {}, p.name), p.status === 'confirmed' ? h('span', { class: 'pill ok' }, 'Confirmed') : null),
+        h('span', { class: `small status-${p.health}` }, '● ' + ({ on_track: 'On track', at_risk: 'At risk', blocked: 'Blocked', unknown: 'No status yet' }[p.health] || p.health)),
+        h('span', { class: 'folder-sum' }, p.summary_preview || 'Summary on its way…'),
+        p.risk ? h('span', { class: 'small', style: 'color:var(--warn)' }, `⚠ ${Math.round(p.risk.share * 100)}% of messages are from ${p.risk.person}`) : null,
+        h('span', { class: 'folder-meta' }, `${p.message_count} messages · ${p.author_count} people · ${p.channel_count} conversations`),
+        h('span', {}, p.keywords.slice(0, 4).map((k) => h('span', { class: 'kw' }, k)))));
+    grid.replaceChildren(...(ps.length ? ps.map(folder) : [h('div', { class: 'empty panel folder-empty', style: 'grid-column:1/-1' },
+      h('h3', {}, tries < 3 ? 'Looking for your projects…' : 'No projects yet'),
+      h('p', { class: 'muted' }, tries < 3 ? 'This takes a few seconds the first time.' : 'Projects appear when a topic repeats across a few days or conversations. You can also start one yourself.'),
+      h('div', { class: 'row', style: 'justify-content:center' }, h('button', { class: 'btn primary', onclick: createProjectDialog }, 'Create a project')))]));
+    tries += 1;
+    return ps.length;
   }
-  await load();
-  every(8000, () => load().catch(() => {}));
+  const n = await load();
+  if (!n) every(5000, () => { if (tries < 6) load().catch(() => {}); });
+  else every(30000, () => load().catch(() => {}));
 }
 function createProjectDialog() {
   modal('New project', (close) => {
@@ -672,13 +753,13 @@ function projectDialog(id, onChange) {
       const s = p.summary, cites = (ids) => ids.map((i) => h('button', { class: 'cite', type: 'button', title: 'Show source message', onclick: () => sourceDialog(i) }, '#' + i));
       body.replaceChildren(h('h2', { style: 'font-size:20px' }, p.name), h('div', { class: `small status-${p.health}` }, '● ' + p.health.replace('_', ' ')),
         p.risk ? h('div', { class: 'banner warn' }, `Single point of failure: ${p.risk.person} wrote ${Math.round(p.risk.share * 100)}% of the ${p.risk.messages} messages here (${p.risk.people} people in total). Consider sharing the knowledge.`) : null,
-        s ? h('div', {}, h('p', {}, s.summary), h('p', { class: 'small muted' }, `Summary v${s.version} · ${s.mode === 'llm' ? 'written by ' + (s.model || 'AI') : 'extractive (no AI call)'} · ${s.message_count} messages`),
+        s ? h('div', {}, h('p', {}, s.summary), h('p', { class: 'small muted' }, `Summary of ${s.message_count} messages` + (isAdmin() ? ` · v${s.version} · ${s.mode}` : '')),
           s.key_points.length ? h('div', {}, h('h3', {}, 'Key points'), h('ul', { class: 'bul' }, s.key_points.map((k) => h('li', {}, k.text, cites(k.sources))))) : null,
           s.open_items.length ? h('div', {}, h('h3', {}, 'Open items'), h('ul', { class: 'bul' }, s.open_items.map((k) => h('li', {}, k.text, cites(k.sources))))) : null) : h('p', { class: 'muted' }, 'No summary yet.'),
-        p.related && p.related.length ? h('div', {}, h('h3', { style: 'margin-top:12px' }, 'Shares people with'), h('div', { class: 'small' }, p.related.map((x) => h('span', { class: 'kw' }, `${x.name} (${x.shared_people})`)), h('span', { class: 'muted' }, ` via ${p.related_source}`))) : null,
-        h('h3', {}, 'People'), h('div', { class: 'small' }, p.people.length ? p.people.map((x) => h('span', { class: 'kw' }, `${x.name} (${x.messages})`)) : 'None', h('span', { class: 'muted' }, ` via ${p.people_source}`)),
+        p.related && p.related.length ? h('div', {}, h('h3', { style: 'margin-top:12px' }, 'Shares people with'), h('div', { class: 'small' }, p.related.map((x) => h('span', { class: 'kw' }, `${x.name} (${x.shared_people})`)), isAdmin() ? h('span', { class: 'muted' }, ` via ${p.related_source}`) : null)) : null,
+        h('h3', {}, 'People'), h('div', { class: 'small' }, p.people.length ? p.people.map((x) => h('span', { class: 'kw' }, `${x.name} (${x.messages})`)) : 'None', isAdmin() ? h('span', { class: 'muted' }, ` via ${p.people_source}`) : null),
         h('h3', { style: 'margin-top:12px' }, 'Keywords'), h('div', {}, p.keywords.map((k) => h('span', { class: 'kw' }, k))),
-        h('h3', { style: 'margin-top:12px' }, 'Recent messages'), h('div', {}, p.recent_messages.slice(0, 5).map((m) => h('div', { class: 'item' }, h('div', {}, h('div', { class: 'small muted' }, `${m.provider === 'gmail' ? '✉ ' : '# '}${m.author_name || m.user_id} · ${m.channel_name} · ${ago(m.message_created_at)}`), h('div', {}, m.text.slice(0, 160)))))),
+        h('h3', { style: 'margin-top:12px' }, 'Latest in this folder'), h('div', {}, p.recent_messages.slice(0, 12).map((m) => h('div', { class: 'item' }, h('div', {}, h('div', { class: 'small muted' }, `${m.provider === 'gmail' ? '✉ ' : '# '}${m.author_name || m.user_id} · ${m.channel_name} · ${ago(m.message_created_at)}`), h('div', {}, m.text.slice(0, 160)))))),
         h('div', { class: 'row', style: 'margin-top:14px' },
           h('button', { class: 'btn sm', onclick: async (e) => { busy(e.target, true, 'Queued'); try { await api(`/projects/${id}/summarize`, { method: 'POST' }); toast('Summary requested'); setTimeout(reload, 3500); } catch (er) { toast(er.message); } } }, 'Regenerate summary'),
           h('button', { class: 'btn sm', onclick: async () => { const n = prompt('Rename project', p.name); if (n && n.trim().length > 1) { try { await api(`/projects/${id}`, { method: 'PATCH', body: { name: n.trim() } }); reload(); onChange(); } catch (er) { toast(er.message); } } } }, 'Rename'),
@@ -691,140 +772,65 @@ function projectDialog(id, onChange) {
 function sourceDialog(id) {
   modal(`Message #${id}`, () => { const b = h('div', {}, h('span', { class: 'spin' })); api(`/messages/${id}`).then((m) => b.replaceChildren(messageCard(m))).catch((e) => b.replaceChildren(h('div', { class: 'banner warn' }, e.status === 404 ? 'This message was deleted or has expired under the retention policy.' : e.message))); return b; });
 }
-function itemCard(item, onChanged) {
-  const status = h('span', { class: `pill ${item.state === 'RESOLVED' ? 'ok' : item.state === 'MUTED' ? '' : 'warn'}` }, item.state.replaceAll('_', ' ').toLowerCase());
-  const controls = [];
-  const move = async (next) => {
-    try { await api(`/api/items/${item.id}`, { method: 'PATCH', body: { expected_version: item.version, state: next } }); await onChanged(); }
-    catch (e) { toast(e.message); }
-  };
-  if (item.state === 'OPEN') controls.push(h('button', { class: 'btn sm', type: 'button', onclick: () => move('ACKNOWLEDGED_PENDING') }, 'I’m on it'));
-  if (['OPEN', 'ACKNOWLEDGED_PENDING'].includes(item.state)) controls.push(h('button', { class: 'btn sm ghost', type: 'button', onclick: () => move('WAITING_ON_OTHER') }, 'Waiting on other'));
-  if (!['RESOLVED', 'MUTED'].includes(item.state)) controls.push(h('button', { class: 'btn sm', type: 'button', onclick: () => move('RESOLVED') }, 'Done'));
-  if (!['RESOLVED', 'MUTED'].includes(item.state)) controls.push(h('button', { class: 'btn sm ghost', type: 'button', onclick: () => move('MUTED') }, 'Mute'));
-  if (['RESOLVED', 'MUTED', 'WAITING_ON_OTHER'].includes(item.state)) controls.push(h('button', { class: 'btn sm', type: 'button', onclick: () => move('OPEN') }, 'Reopen'));
-  controls.push(h('button', { class: 'btn sm ghost', type: 'button', onclick: () => editItemDialog(item, onChanged) }, 'Edit'));
-  const sources = item.sources.length ? h('details', { class: 'item-sources' },
-    h('summary', {}, `${item.sources.length} source${item.sources.length === 1 ? '' : 's'}`),
-    item.sources.map((source) => h('button', { class: 'item-source', type: 'button', onclick: () => sourceDialog(source.id) },
-      h('b', {}, source.author_name || 'Source'), h('span', {}, (source.text || '').slice(0, 180))))) : null;
-  return h('article', { class: 'item-card' },
-    h('div', { class: 'item-card-heading' }, h('h3', {}, item.title), status),
-    h('div', { class: 'item-card-meta' }, item.kind.replaceAll('_', ' '), ' · ', item.direction.replaceAll('_', ' '),
-      item.due_at ? ` · Due ${when(item.due_at)}` : ''),
-    h('p', { class: 'item-explanation' }, item.explanation),
-    sources,
-    h('div', { class: 'row item-actions' }, ...controls));
-}
-function editItemDialog(item, onChanged) {
-  modal('Edit item', (close) => {
-    const title = h('input', { class: 'input', maxlength: '500', value: item.title, 'aria-label': 'Item title' });
-    const due = h('input', { class: 'input', type: 'datetime-local', 'aria-label': 'Due date and time' });
-    if (item.due_at) {
-      const local = new Date(new Date(item.due_at).getTime() - new Date(item.due_at).getTimezoneOffset() * 60000);
-      due.value = local.toISOString().slice(0, 16);
-    }
-    const save = h('button', { class: 'btn primary', type: 'submit' }, 'Save changes');
-    const form = h('form', { class: 'item-form', onsubmit: async (event) => {
-      event.preventDefault();
-      const body = { expected_version: item.version, title: title.value.trim() };
-      if (due.value) body.due_at = new Date(due.value).toISOString();
-      else if (item.due_at) { body.due_at = null; body.due_kind = 'none'; }
-      try { await api(`/api/items/${item.id}`, { method: 'PATCH', body }); close(); await onChanged(); }
-      catch (e) { toast(e.message); }
-    } },
-      h('label', {}, 'Title', title), h('label', {}, 'Due date (optional)', due),
-      h('div', { class: 'row' }, save));
-    return form;
-  });
-}
-function addItemDialog(onCreated, sourceMessageId = null, defaultTitle = '') {
-  modal('Add to Brief', (close) => {
-    const title = h('input', { class: 'input', maxlength: '500', required: true, 'aria-label': 'Item title', placeholder: 'What needs to happen?', value: defaultTitle });
-    const kind = h('select', { class: 'input', 'aria-label': 'Item type' },
-      [['commitment', 'Commitment'], ['follow_up', 'Follow-up'], ['meeting', 'Meeting']].map(([value, label]) => h('option', { value }, label)));
-    const direction = h('select', { class: 'input', 'aria-label': 'Who owns the next step?' },
-      [['asked_of_me', 'Someone asked me'], ['i_promised', 'I promised'], ['they_promised', 'They promised'], ['i_asked', 'I asked someone']].map(([value, label]) => h('option', { value }, label)));
-    const due = h('input', { class: 'input', type: 'datetime-local', 'aria-label': 'Due date and time (optional)' });
-    const sources = h('input', { class: 'input', 'aria-label': 'Source message IDs (optional)', placeholder: 'Source message IDs, comma-separated', value: sourceMessageId == null ? '' : String(sourceMessageId) });
-    const save = h('button', { class: 'btn primary', type: 'submit' }, 'Add item');
-    const form = h('form', { class: 'item-form', onsubmit: async (event) => {
-      event.preventDefault();
-      const ids = sources.value.trim() ? sources.value.split(',').map((raw) => Number(raw.trim())) : [];
-      if (ids.some((id) => !Number.isSafeInteger(id) || id < 1)) { toast('Source message IDs must be positive whole numbers.'); return; }
-      const body = { title: title.value.trim(), kind: kind.value, direction: direction.value, source_message_ids: ids };
-      if (due.value) { body.due_at = new Date(due.value).toISOString(); body.due_kind = 'stated'; }
-      try { await api('/api/items', { method: 'POST', body }); close(); await onCreated(); toast('Added to your Brief.'); }
-      catch (e) { toast(e.message); }
-    } },
-      h('label', {}, 'Title', title), h('label', {}, 'Type', kind), h('label', {}, 'Next step belongs to', direction),
-      h('label', {}, 'Due date (optional)', due), h('label', {}, 'Source messages (optional)', sources),
-      h('p', { class: 'small muted' }, 'Items are manually confirmed. Unconfirmed message detections are not shown as commitments.'),
-      h('div', { class: 'row' }, save));
-    return form;
-  }, { wide: true });
-}
-// ---------------------------------------------------------------------- ask ---
-async function viewAsk(main) {
-  const [dash, calendar] = await Promise.all([
-    api('/dashboard/summary'),
-    api('/integrations/google-calendar/connection'),
+// ----------------------------------------------------------------- assistant ---
+async function viewAssistant(main) {
+  const [dash, projs, conn, calendar] = await Promise.all([
+    api('/dashboard/summary'), api('/projects'), api('/integrations/slack/connection'), api('/integrations/google-calendar/connection'),
   ]);
-  const empty = !dash.messages_total && !calendar.connected;
+  let empty = !dash.messages_total && !calendar.connected;
   const q = h('input', { class: 'input assistant-question', placeholder: empty ? 'Connect an account to get started…' : 'Ask about your work…', maxlength: '2000', 'aria-label': 'Question', disabled: empty });
   const thread = h('div', { class: 'chat-thread', role: 'log', 'aria-live': 'polite', 'aria-label': 'Assistant conversation' });
   const chatHistory = [];
   const askButton = h('button', { class: 'btn primary', type: 'submit', disabled: empty }, 'Send');
+  const suggestions = h('div', { class: 'assistant-suggestions' });
   const ask = async (text) => {
     const question = text.trim();
     if (!question || askButton.disabled) return;
-    thread.append(h('div', { class: 'chat-message user' }, h('div', { class: 'chat-label' }, 'You'), h('p', {}, question)));
-    const pending = h('div', { class: 'chat-message assistant' }, h('div', { class: 'chat-label' }, 'ContextOS'), h('div', { class: 'chat-loading' }, h('span', { class: 'spin', 'aria-hidden': 'true' }), 'Looking through your messages…'));
+    thread.append(h('div', { class: 'chat-message user' }, h('p', {}, question)));
+    const pending = h('div', { class: 'chat-message assistant' }, h('div', { class: 'chat-loading' }, h('span', { class: 'spin', 'aria-hidden': 'true' }), 'Looking through your messages…'));
     thread.append(pending);
     q.value = '';
     askButton.disabled = true;
-    thread.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    pending.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    let found = [], streamedText = '', bodyEl = null, srcEl = null;
+    const draw = (text, final) => {
+      const body = richAnswer(final ? text : cleanAssistantText(text).replace(/\[\d{0,2}$/, ''), found, openSource);
+      if (bodyEl) bodyEl.replaceWith(body); else pending.append(body);
+      bodyEl = body;
+    };
+    const drawSources = (list, cited) => {
+      // Sources stay out of the way: a single "+ N sources" control that opens the cards only when the person asks.
+      const ordered = [...list].sort((x, y) => (cited.includes(y.n) ? 1 : 0) - (cited.includes(x.n) ? 1 : 0) || x.n - y.n);
+      const el = ordered.length ? h('details', { class: 'sources-details' },
+        h('summary', {}, h('span', { class: 'plus', 'aria-hidden': 'true' }, '＋'), ` ${ordered.length} source${ordered.length === 1 ? '' : 's'}`),
+        h('div', { class: 'source-cards' }, ordered.map((x) => sourceCard(x, openSource)))) : null;
+      if (srcEl) { if (el) srcEl.replaceWith(el); else srcEl.remove(); } else if (el) pending.append(el);
+      srcEl = el;
+    };
     try {
-      let liveAnswer = null, streamedText = '';
       const r = await streamAssistant(question, (token) => {
         streamedText += token;
-        const visibleText = cleanAssistantText(streamedText);
-        if (!liveAnswer) {
-          liveAnswer = h('div', { class: 'answer-text' }, visibleText);
-          pending.replaceChildren(h('div', { class: 'chat-label' }, 'ContextOS'), liveAnswer);
-        } else {
-          liveAnswer.textContent = visibleText;
-        }
-      }, chatHistory.slice(-8));
+        pending.querySelector('.chat-loading')?.remove();
+        draw(streamedText, false);
+      }, chatHistory.slice(-8), (list) => { found = list; const l = pending.querySelector('.chat-loading'); if (l) l.lastChild.textContent = `Reading ${list.length} message${list.length === 1 ? '' : 's'}…`; });
       const sources = Array.isArray(r.sources) ? r.sources : [];
+      found = sources;
       const answer = typeof r.answer === 'string' && r.answer.trim() && r.answer.trim().toLowerCase() !== 'null'
-        ? cleanAssistantText(r.answer)
-        : sources.length ? 'A few messages may help answer that.' : 'I couldn’t find anything relevant in your connected messages yet.';
-      chatHistory.push({ role: 'user', content: question }, { role: 'assistant', content: answer });
+        ? r.answer.trim() : sources.length ? 'A few messages may help answer that.' : 'I couldn’t find anything relevant in your connected messages yet.';
+      chatHistory.push({ role: 'user', content: question }, { role: 'assistant', content: answer.replace(/\s*\[\d{1,2}\]/g, '') });
       if (chatHistory.length > 8) chatHistory.splice(0, chatHistory.length - 8);
-      const sourceDisclosure = sources.length ? h('details', { class: 'chat-sources' },
-        h('summary', {}, `Sources (${sources.length})`),
-        h('div', { class: 'chat-source-list' }, sources.map((s) => h('button', {
-          class: 'chat-source-link', type: 'button', onclick: () => sourceDialog(s.message_id),
-          'aria-label': `Open source message ${s.message_id}${s.author ? ` from ${s.author}` : ''}`,
-        }, h('span', { class: 'chat-source-id' }, `#${s.message_id}`), h('span', {}, `${s.author || 'Message'} · ${(s.text || '').slice(0, 180)}`))))) : null;
-      const suggestedReply = r.suggested_reply && typeof r.suggested_reply.draft === 'string'
-        ? h('div', { class: 'msg P2 assistant-reply-draft' },
-          h('div', { class: 'meta' }, `Draft for ${r.suggested_reply.recipient}`),
-          h('p', {}, `“${r.suggested_reply.draft}”`),
-          h('button', { class: 'btn sm', type: 'button', onclick: () => openChannelComposer(r.suggested_reply.channel_options, r.suggested_reply.draft) }, 'Review and choose channel'))
-        : null;
-      const composeAction = r.channel_compose
-        ? h('button', { class: 'btn sm', type: 'button', onclick: () => openChannelComposer() }, 'Compose message')
-        : null;
-      const answerNote = typeof r.note === 'string' && r.note.trim()
-        ? h('div', { class: 'answer-note' }, r.note)
-        : null;
-      pending.replaceChildren(h('div', { class: 'chat-label' }, 'ContextOS'), h('div', { class: 'answer-text' }, answer),
-        answerNote, suggestedReply, composeAction, sourceDisclosure);
+      pending.querySelector('.chat-loading')?.remove();
+      draw(answer, true);
+      drawSources(sources, Array.isArray(r.cited) ? r.cited : []);
+      if (r.suggested_reply && typeof r.suggested_reply.draft === 'string') {
+        pending.append(h('div', { class: 'draft-card' }, h('div', { class: 'meta' }, `Draft for ${r.suggested_reply.recipient}`), h('p', {}, `“${r.suggested_reply.draft}”`),
+          h('button', { class: 'btn sm', type: 'button', onclick: () => openChannelComposer(r.suggested_reply.channel_options, r.suggested_reply.draft) }, 'Review and choose channel')));
+      }
+      if (r.channel_compose) pending.append(h('button', { class: 'btn sm', type: 'button', onclick: () => openChannelComposer() }, 'Compose message'));
       pending.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      suggestions.hidden = true;
     } catch (e) {
-      pending.replaceChildren(h('div', { class: 'chat-label' }, 'ContextOS'), h('p', { role: 'alert' }, e.message));
+      pending.replaceChildren(h('p', { role: 'alert' }, e.message));
       pending.classList.add('chat-error');
     } finally {
       askButton.disabled = empty;
@@ -832,75 +838,63 @@ async function viewAsk(main) {
     }
   };
   const form = h('form', { class: 'row', onsubmit: (e) => { e.preventDefault(); ask(q.value); } }, h('div', { style: 'flex:1;min-width:220px' }, q), askButton);
-  main.replaceChildren(header('Ask', 'Ask about your connected messages and calendar.',
-    empty ? h('button', { class: 'btn', type: 'button', onclick: () => go('settings') }, 'Connect account') : null),
-    thread,
-    h('div', { class: 'chat-composer' }, h('section', { class: 'assistant-ask' }, form,
-      h('div', { class: 'chat-status' }, 'Answers are grounded in your connected sources.'))));
-}
-
-// --------------------------------------------------------------- workspace ---
-async function viewWorkspace(main) {
-  const [calendar, brief, calendarEvents] = await Promise.all([
-    api('/integrations/google-calendar/connection'),
-    api('/api/items/brief').catch((error) => ({ items: [], total_open: 0, scoring: 'rules_only', error: error.message })),
-    api('/integrations/google-calendar/events/today').catch((error) => ({ events: [], error: error.message })),
-  ]);
-  const briefItems = h('div', { class: 'brief-items' });
-  const todayEvents = h('section', { class: 'panel calendar-panel' },
-    h('div', { class: 'hd' }, h('h2', {}, 'Today'), calendar.connected
-      ? h('span', { class: 'pill ok' }, 'Calendar connected')
-      : h('button', { class: 'btn sm', type: 'button', onclick: () => go('settings') }, 'Connect Calendar')),
-    calendarEvents.error
-      ? h('div', { class: 'banner err' }, calendarEvents.error)
-      : h('div', { class: 'calendar-events' }, ...(calendarEvents.events.length
-        ? calendarEvents.events.map((event) => h('div', { class: 'calendar-event' }, h('time', {}, event.time), h('span', {}, event.title)))
-        : [h('div', { class: 'empty small' }, calendar.connected ? 'No calendar events today.' : 'Connect Google Calendar to see real events here.')])));
-  const briefSection = h('section', { class: 'panel brief-panel' },
-    h('div', { class: 'hd' }, h('div', {}, h('h2', {}, 'Your Brief'),
-      h('p', { class: 'small muted' }, 'A short, ranked view of confirmed commitments and follow-ups.'))),
-    briefItems);
-  main.replaceChildren(header('Workspace Brief', 'Your confirmed work and today’s calendar.'),
-    h('div', { class: 'workspace-grid' }, briefSection, todayEvents));
-
-  function renderItems(items, error) {
-    briefItems.replaceChildren(...(error
-      ? [h('div', { class: 'banner err' }, error)]
-      : items.length
-        ? items.map((item) => itemCard(item, refreshBrief))
-        : [h('div', { class: 'empty small' }, 'Nothing confirmed yet. Add an item from the Inbox to include it here.')]));
-  }
-  renderItems(brief.items, brief.error);
-
-  async function refreshBrief() {
-    try {
-      const latest = await api('/api/items/brief');
-      renderItems(latest.items, null);
-    } catch (error) {
-      renderItems([], error.message);
+  const urgentCount = dash.urgent ?? 0;
+  let calendarConnected = calendar.connected;
+  let connectedCount = conn.connections.filter((c) => c.status === 'connected').length + Number(calendarConnected);
+  const questionsFor = (summary, projects) => {
+    const questions = ['What needs my attention?'];
+    const urgent = summary.urgent ?? 0;
+    if (summary.pending_reminders) questions.push('What is due today?');
+    if (urgent) questions.push('Summarise the urgent messages');
+    if (projects.length) questions.push(`What is the status of ${projects[0].name}?`);
+    else if (summary.messages_total) questions.push('Summarise the important updates');
+    if (projects.length > 1) questions.push(`Who should I ask about ${projects[0].name}?`);
+    return questions;
+  };
+  const messagesStat = h('button', { class: 'text-action', type: 'button', onclick: () => openInbox('all') }, `${dash.messages_total} messages`);
+  const projectsStat = h('button', { class: 'text-action', type: 'button', onclick: () => go('projects') }, `${projs.length} projects`);
+  const urgentStat = h('button', { class: 'text-action', type: 'button', onclick: () => openInbox('urgent') }, `${urgentCount} urgent`);
+  const sourcesStat = h('button', { class: 'text-action assistant-sources', type: 'button', onclick: () => go('settings') }, `${connectedCount} connected sources`);
+  const stats = h('div', { class: 'assistant-summary' },
+    messagesStat,
+    h('span', { 'aria-hidden': 'true' }, '·'),
+    projectsStat,
+    h('span', { 'aria-hidden': 'true' }, '·'),
+    urgentStat,
+    h('span', { 'aria-hidden': 'true' }, '·'),
+    sourcesStat);
+  const start = h('section', { class: 'assistant-intro' },
+    h('h2', {}, empty ? `Welcome${state.user.name ? ', ' + state.user.name.split(' ')[0] : ''}. What would you like to know?` : 'What would you like to know?'),
+    h('p', {}, empty ? (calendarConnected ? 'Your Google Calendar is connected. Ask about your schedule.' : connectedCount ? 'Your account is connected. Messages will appear here after the first sync.' : 'Connect Slack, Gmail, or Google Calendar to get started.') : 'Find answers in your connected messages and calendar. Every message-based answer links back to its source.'),
+    empty && !connectedCount ? h('a', { class: 'text-action', href: '#settings', onclick: (e) => { e.preventDefault(); go('settings'); } }, 'Connect an account') : null);
+  const renderSuggestions = (summary, projects) => suggestions.replaceChildren(...(empty ? [] : [...questionsFor(summary, projects), ...(calendarConnected ? ['Any meetings today?'] : [])].map((s) => h('button', { class: 'suggestion', type: 'button', onclick: () => ask(s) }, s))));
+  renderSuggestions(dash, projs);
+  main.replaceChildren(header('Assistant'), start, stats, thread, h('div', { class: 'chat-composer' }, h('section', { class: 'assistant-ask' }, form, suggestions,
+    h('div', { class: 'chat-status' }, 'Answers use your connected messages and calendar. Message sources are linked below.'))));
+  let liveUpdateFailed = false;
+  async function refreshLiveSummary() {
+    const [latest, latestConn, latestCalendar] = await Promise.all([
+      api('/dashboard/summary'), api('/integrations/slack/connection'), api('/integrations/google-calendar/connection'),
+    ]);
+    const latestUrgent = latest.urgent ?? 0;
+    calendarConnected = latestCalendar.connected;
+    connectedCount = latestConn.connections.filter((c) => c.status === 'connected').length + Number(calendarConnected);
+    messagesStat.textContent = `${latest.messages_total} ${latest.messages_total === 1 ? 'message' : 'messages'}`;
+    urgentStat.textContent = `${latestUrgent} urgent`;
+    sourcesStat.textContent = `${connectedCount} connected sources`;
+    if (empty && (latest.messages_total || latestCalendar.connected)) {
+      empty = false;
+      q.disabled = false;
+      q.placeholder = 'Ask about your work…';
+      askButton.disabled = false;
+      start.querySelector('p').textContent = calendarConnected && !latest.messages_total
+        ? 'Your Google Calendar is connected. Ask about your schedule.'
+        : 'Find answers in your connected messages and calendar. Every message-based answer links back to its source.';
     }
+    renderSuggestions(latest, projs);
+    liveUpdateFailed = false;
   }
-}
-
-// --------------------------------------------------------------------- ledger ---
-async function viewLedger(main) {
-  const filter = h('select', { class: 'input ledger-filter', 'aria-label': 'Filter items' },
-    [['active', 'Active'], ['RESOLVED', 'Resolved'], ['MUTED', 'Muted'], ['OPEN', 'Open'], ['ACKNOWLEDGED_PENDING', 'In progress'], ['WAITING_ON_OTHER', 'Waiting']].map(([value, label]) => h('option', { value }, label)));
-  const add = h('button', { class: 'btn primary', type: 'button', onclick: () => addItemDialog(load) }, 'Add item');
-  const list = h('div', { class: 'ledger-list' });
-  const inboxLink = h('button', { class: 'btn', type: 'button', onclick: () => openInbox('all') }, 'Message inbox');
-  main.replaceChildren(header('Ledger', 'The source of truth for confirmed commitments, follow-ups, and meetings.', add, inboxLink),
-    h('div', { class: 'ledger-toolbar' }, h('span', { class: 'small muted' }, 'Ranked by transparent, rules-only signals; not presented as trained or calibrated.'), filter), list);
-  filter.addEventListener('change', load);
-  await load();
-  async function load() {
-    try {
-      const rows = await api(`/api/items?state_filter=${encodeURIComponent(filter.value)}`);
-      list.replaceChildren(...(rows.length ? rows.map((item) => itemCard(item, load)) : [h('div', { class: 'empty' }, 'No items in this view. Add a confirmed item to keep it in your Ledger.')]));
-    } catch (e) {
-      list.replaceChildren(h('div', { class: 'banner err' }, e.message));
-    }
-  }
+  every(30000, () => refreshLiveSummary().catch(() => { liveUpdateFailed = true; }));
 }
 
 // ------------------------------------------------------------------ pipeline ---
@@ -954,13 +948,28 @@ async function viewPipeline(main) {
 // ------------------------------------------------------------------ settings ---
 async function viewSettings(main) {
   const connBox = h('div', {}), calendarBox = h('div', {}), smartBox = h('div', {});
-  main.replaceChildren(header('Settings', 'Connected accounts and your preferences.'), h('div', { class: 'panel' }, h('div', { class: 'hd' }, h('h2', {}, 'Slack')), connBox),
-    h('div', { class: 'panel' }, h('div', { class: 'hd' }, h('h2', {}, 'Google Calendar')), calendarBox),
-    h('div', { class: 'panel' }, h('div', { class: 'hd' }, h('h2', {}, 'Smart features')), smartBox),
-    state.config.demo_enabled ? h('div', { class: 'panel' }, h('h2', { style: 'margin-bottom:6px' }, 'Sample data'), h('p', { class: 'small muted' }, 'A fake workspace and mailbox that runs through the real pipeline, so you can try every feature.'),
-      h('div', { class: 'row' }, h('button', { class: 'btn', onclick: loadSampleData }, '⬇ Load sample data'), h('button', { class: 'btn danger', onclick: async () => { if (!confirm('Remove the sample workspace and everything derived from it?')) return; try { await api('/api/demo/reset', { method: 'POST' }); toast('Sample data removed'); } catch (e) { toast(e.message); } } }, 'Remove sample data'))) : null,
-    h('div', { class: 'panel' }, h('h2', { style: 'margin-bottom:10px' }, 'Account'), h('div', { class: 'kv' }, h('b', {}, 'Name'), state.user.name, h('b', {}, 'Email'), state.user.email, h('b', {}, 'Signed in with'), state.user.signed_in_with_google ? 'Google' : 'Email + password'),
-      h('div', { class: 'row', style: 'margin-top:14px' }, h('button', { class: 'btn', onclick: signOut }, 'Sign out'), h('button', { class: 'btn danger', onclick: deleteAccountDialog }, 'Delete my account and data'))));
+  const sections = [['connections', 'Connected accounts', 'Slack, Gmail and Calendar'], ['account', 'Account', 'Your profile and data'], ...(isAdmin() ? [['system', 'System', 'Admin only']] : [])];
+  let current = sections.some((x) => x[0] === state.settingsTab) ? state.settingsTab : 'connections';
+  const panes = {
+    connections: h('div', { class: 'settings-pane' },
+      h('section', { class: 'set-card' }, h('div', { class: 'set-head' }, h('h2', {}, 'Slack & Gmail'), h('p', { class: 'muted small' }, 'Messages from these accounts feed your Inbox, Projects and the Assistant. Access is read-only unless you allow replies.')), connBox),
+      h('section', { class: 'set-card' }, h('div', { class: 'set-head' }, h('h2', {}, 'Google Calendar'), h('p', { class: 'muted small' }, 'Lets the Assistant answer questions about your schedule.')), calendarBox)),
+    account: h('div', { class: 'settings-pane' },
+      h('section', { class: 'set-card' }, h('div', { class: 'set-head' }, h('h2', {}, 'Profile')),
+        h('div', { class: 'person-head' }, avatar(state.user.name || state.user.email, 56), h('div', {}, h('b', {}, state.user.name || 'Your account'), h('div', { class: 'muted small' }, state.user.email), h('div', { class: 'muted small' }, state.user.signed_in_with_google ? 'Signed in with Google' : 'Signed in with email and password'))),
+        h('div', { class: 'row', style: 'margin-top:14px' }, h('button', { class: 'btn', onclick: signOut }, 'Sign out'))),
+      h('section', { class: 'set-card danger-zone' }, h('div', { class: 'set-head' }, h('h2', {}, 'Delete my data'), h('p', { class: 'muted small' }, 'Revokes Slack and Gmail access and permanently erases your messages, projects and account.')),
+        h('button', { class: 'btn danger', onclick: deleteAccountDialog }, 'Delete my account and data'))),
+    system: h('div', { class: 'settings-pane' },
+      h('section', { class: 'set-card' }, h('div', { class: 'set-head' }, h('h2', {}, 'Smart features'), h('p', { class: 'muted small' }, 'Search by meaning and the relationship graph.')), smartBox),
+      state.config.demo_enabled ? h('section', { class: 'set-card' }, h('div', { class: 'set-head' }, h('h2', {}, 'Sample data'), h('p', { class: 'muted small' }, 'A fake workspace and mailbox that runs through the real pipeline.')),
+        h('div', { class: 'row' }, h('button', { class: 'btn', onclick: loadSampleData }, 'Load sample data'), h('button', { class: 'btn danger', onclick: async () => { if (!confirm('Remove the sample workspace and everything derived from it?')) return; try { await api('/api/demo/reset', { method: 'POST' }); toast('Sample data removed'); } catch (e) { toast(e.message); } } }, 'Remove sample data'))) : null),
+  };
+  const nav = h('nav', { class: 'settings-nav', 'aria-label': 'Settings sections' }, sections.map(([id, label, sub]) => h('button', { type: 'button', 'data-id': id, 'aria-current': id === current ? 'page' : null, onclick: () => show(id) }, h('b', {}, label), h('span', {}, sub))));
+  const pane = h('div', { class: 'settings-body' });
+  function show(id) { current = id; state.settingsTab = id; nav.querySelectorAll('button').forEach((b) => b.setAttribute('aria-current', b.dataset.id === id ? 'page' : 'false')); pane.replaceChildren(panes[id]); }
+  main.replaceChildren(header('Settings', 'Accounts and preferences.'), h('div', { class: 'settings-layout' }, nav, pane));
+  show(current);
   async function loadSmart() {
     const st = await api('/api/intelligence/status');
     const badge = (name, x) => h('span', { class: `pill ${x.state === 'on' ? 'ok' : x.state === 'error' ? 'err' : ''}` }, `${name}: ${x.state === 'on' ? 'on' : x.state === 'error' ? 'not reachable' : 'off'}`);
@@ -977,7 +986,7 @@ async function viewSettings(main) {
     ]);
     connBox.replaceChildren(...(c.connections.length ? c.connections.map(connCard) : [h('p', { class: 'muted' }, 'No Slack workspace connected.')]),
       h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'btn primary', onclick: () => modal('Connect Slack', () => { const b = h('div', {}); levelPicker(b, c.oauth_configured); return b; }) }, c.connections.length ? 'Connect another workspace' : 'Connect Slack'),
-        h('a', { class: 'btn', href: c.gmail_configured ? '/integrations/gmail/connect' : '#', onclick: (e) => { if (!c.gmail_configured) { e.preventDefault(); toast('Gmail needs GOOGLE_CLIENT_ID / SECRET on the server.'); } } }, c.connections.some((x) => x.provider === 'gmail') ? 'Connect another Gmail' : 'Connect Gmail')));
+        h('a', { class: 'btn', href: c.gmail_configured ? '/integrations/gmail/connect' : '#', onclick: (e) => { if (!c.gmail_configured) { e.preventDefault(); toast(isAdmin() ? 'Gmail needs GOOGLE_CLIENT_ID / SECRET on the server.' : 'Gmail isn’t available yet. Ask your administrator.'); } } }, c.connections.some((x) => x.provider === 'gmail') ? 'Connect another Gmail' : 'Connect Gmail')));
     const calendarActions = calendar.connected
       ? [
         calendar.configured ? h('a', { class: 'btn sm', href: '/integrations/google-calendar/connect' }, 'Switch account') : null,
@@ -991,13 +1000,13 @@ async function viewSettings(main) {
         } }, 'Disconnect'),
       ]
       : h('a', { class: 'btn primary', href: calendar.configured ? '/integrations/google-calendar/connect' : '#', onclick: (e) => {
-        if (!calendar.configured) { e.preventDefault(); toast('Google Calendar needs Google OAuth and TOKEN_ENCRYPTION_KEY configured on the server.'); }
+        if (!calendar.configured) { e.preventDefault(); toast(isAdmin() ? 'Google Calendar needs Google OAuth and TOKEN_ENCRYPTION_KEY configured on the server.' : 'Google Calendar isn’t available yet. Ask your administrator.'); }
       } }, 'Connect Google Calendar');
     calendarBox.replaceChildren(
       h('p', { class: 'small muted' }, calendar.connected
         ? `Connected as ${calendar.email}. ContextOS can read event titles and times; it cannot create, edit, or delete events.`
         : 'Connect your Google Calendar to check your schedule from the Assistant. Access is read-only.'),
-      calendar.status === 'needs_reauth' ? h('div', { class: 'banner warn' }, 'Google Calendar access expired or was revoked. Reconnect to check your schedule.') : null,
+      ...(calendar.status === 'needs_reauth' ? [h('div', { class: 'banner warn' }, 'Google Calendar access expired or was revoked. Reconnect to check your schedule.')] : []),
       h('div', { class: 'row', style: 'margin-top:10px' }, calendarActions));
   }
   function connCard(c) {
@@ -1012,9 +1021,8 @@ async function viewSettings(main) {
         h('button', { class: 'btn sm danger', onclick: () => disconnectDialog(c, load) }, 'Disconnect')));
   }
   await load();
-  loadSmart().catch((e) => smartBox.replaceChildren(h('div', { class: 'banner err' }, e.message)));
-  every(5000, () => load().catch(() => {}));
-  every(20000, () => loadSmart().catch(() => {}));
+  if (isAdmin()) { loadSmart().catch((e) => smartBox.replaceChildren(h('div', { class: 'banner err' }, e.message))); every(30000, () => loadSmart().catch(() => {})); }
+  every(10000, () => load().catch(() => {}));
 }
 function disconnectDialog(c, done) {
   modal('Disconnect', (close) => {

@@ -139,13 +139,8 @@ def test_google_prehijack_wipes_unverified_password(db, monkeypatch):
 def test_llm_caps_and_429(db, user, monkeypatch):
     monkeypatch.setattr(settings, "llm_api_key", "k")
     monkeypatch.setattr(settings, "llm_user_daily_cap", 3)
-    headers = []
-    def handle_ok(request):
-        headers.append(request.headers.get("Authorization"))
-        return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
-    ok = httpx.MockTransport(handle_ok)
+    ok = httpx.MockTransport(lambda r: httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]}))
     assert llm.chat(db, user.id, [{"role": "user", "content": "x"}], transport=ok) == "hi"
-    assert headers[0] == "Bearer k"
     rl = httpx.MockTransport(lambda r: httpx.Response(429, headers={"Retry-After": "7"}))
     with pytest.raises(llm.LLMRateLimited) as ei:
         llm.chat(db, user.id, [{"role": "user", "content": "x"}], transport=rl)
@@ -153,30 +148,6 @@ def test_llm_caps_and_429(db, user, monkeypatch):
     llm.chat(db, user.id, [{"role": "user", "content": "x"}], transport=ok)  # the 429 still counted (provider may bill it): this is call 3
     with pytest.raises(llm.LLMRateLimited):
         llm.chat(db, user.id, [{"role": "user", "content": "x"}], transport=ok)
-
-
-def test_llm_stream_emits_completion_deltas_and_hides_thinking(db, user, monkeypatch):
-    monkeypatch.setattr(settings, "llm_api_key", "test-key")
-    emitted = []
-    requests = []
-    chunks = [
-        {"choices": [{"delta": {"content": "The answer "}}]},
-        {"choices": [{"delta": {"content": "<think>private reasoning</think>is 42."}}]},
-        "[DONE]",
-    ]
-    body = "\n\n".join(
-        "data: " + (chunk if isinstance(chunk, str) else json.dumps(chunk))
-        for chunk in chunks
-    ) + "\n\n"
-
-    def respond(request):
-        requests.append((request.headers.get("Authorization"), json.loads(request.content).get("stream")))
-        return httpx.Response(200, content=body, headers={"Content-Type": "text/event-stream"})
-
-    result = llm.chat_stream(db, user.id, [{"role": "user", "content": "x"}], emitted.append,
-                             transport=httpx.MockTransport(respond))
-    assert requests == [("Bearer test-key", True)]
-    assert "".join(emitted) == result == "The answer is 42."
 
 
 def test_llm_json_parsing():

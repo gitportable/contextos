@@ -1,23 +1,17 @@
-"""User-facing intelligence endpoints. Open to every signed-in user, always owner-scoped.
-Each response says which engine answered (`source`), and every one still works from PostgreSQL alone when a service is off."""
-from typing import Literal
-
+"""Endpoints powered by Qdrant (meaning) and Neo4j (relationships). Search, related messages, merge suggestions and People are
+open to every signed-in user and always owner-scoped; each still works from PostgreSQL alone when a service is off.
+The status of the services themselves, and rebuilding their indexes, are operational: administrators only."""
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app import auth, integrations, intelligence, item_events, ratelimit
+from app import auth, integrations, intelligence, ratelimit
 from app.config import settings
 from app.database import get_db
 from app.jobs import INDEX_BACKFILL, enqueue_job
 from app.models import SlackMessage, User
 
 router = APIRouter(tags=["intelligence"])
-
-
-class RankingFeedbackIn(BaseModel):
-    label: Literal["not_urgent", "wrong_person", "not_mine", "always_show"]
 
 
 def _err(status: int, code: str, message: str):
@@ -50,18 +44,6 @@ def related(message_id: int, limit: int = 6, user: User = Depends(auth.current_u
     return intelligence.related_messages(db, user, m, limit=max(1, min(limit, 12)))
 
 
-@router.post("/messages/{message_id}/feedback")
-def ranking_feedback(message_id: int, data: RankingFeedbackIn, user: User = Depends(auth.current_user),
-                     db: Session = Depends(get_db)):
-    message = db.query(SlackMessage).filter_by(id=message_id, owner_id=user.id, is_deleted=False).first()
-    if not message:
-        raise _err(404, "not_found", "Message not found.")
-    item_events.record_message_event(db, owner_id=user.id, message_id=message.id, event_type="feedback",
-                                    payload={"label": data.label})
-    db.commit()
-    return {"ok": True, "message_id": message.id, "label": data.label}
-
-
 @router.get("/api/projects/merge-suggestions")
 def merge_suggestions(user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     return intelligence.merge_suggestions(db, user)
@@ -80,7 +62,7 @@ def person(name: str, user: User = Depends(auth.current_user), db: Session = Dep
 
 
 @router.get("/api/intelligence/status")
-def status(user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def status(user: User = Depends(auth.require_admin), db: Session = Depends(get_db)):
     """What the smart features can do right now, for this user's data. Never reveals server addresses or credentials."""
     uid = user.id
     live = db.query(func.count(SlackMessage.id)).filter(SlackMessage.owner_id == uid, SlackMessage.is_deleted.is_(False), SlackMessage.priority_label != "P3").scalar() or 0
@@ -115,7 +97,7 @@ def status(user: User = Depends(auth.current_user), db: Session = Depends(get_db
 
 
 @router.post("/api/intelligence/rebuild")
-def rebuild(background: BackgroundTasks, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+def rebuild(background: BackgroundTasks, user: User = Depends(auth.require_admin), db: Session = Depends(get_db)):
     """Catch Qdrant and Neo4j up with everything already stored (for example after switching them on)."""
     _limit(user, "expensive:user", settings.rl_expensive_user_per_hour, 3600)
     if not (settings.qdrant_enabled or settings.neo4j_enabled):

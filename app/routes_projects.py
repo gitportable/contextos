@@ -1,7 +1,8 @@
 """Project endpoints. Every query is scoped to the signed-in user; a project id from another user is a plain 404."""
 import re
+import threading
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
@@ -57,12 +58,45 @@ def _card(db: Session, p: Project) -> dict:
             "summary_preview": (s.summary_text[:200] if s else None)}
 
 
+_drain_lock = threading.Lock()
+
+
+def _drain_once(run) -> None:
+    """One in-process drain at a time: refreshing the page ten times must not start ten competing runners."""
+    if not _drain_lock.acquire(blocking=False):
+        return
+    try:
+        run(200, 20.0)
+    finally:
+        _drain_lock.release()
+
+
+def _run_queue_here(background: BackgroundTasks, db: Session) -> str:
+    """Discovery and summaries are queue jobs. With no worker process running they would sit there forever and the
+    Projects page would stay empty, so in that case drain the queue in this process, after the response is sent."""
+    from app.worker import run_pending_jobs, worker_online
+    if worker_online(db):
+        return "worker"
+    background.add_task(_drain_once, run_pending_jobs)
+    return "in-process"
+
+
 @router.get("/projects")
-def list_projects(include: str = "active", user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_projects(background: BackgroundTasks, include: str = "active", user: User = Depends(current_user), db: Session = Depends(get_db)):
     q = db.query(Project).filter(Project.owner_id == user.id)
     q = q if include == "all" else q.filter(Project.status.in_(("auto", "confirmed")))
     risks = intelligence.project_risks(db, user)
-    return [{**_card(db, p), "risk": risks.get(p.id)} for p in q.order_by(desc(Project.message_count), desc(Project.score)).limit(100).all()]
+    cards = [{**_card(db, p), "risk": risks.get(p.id)} for p in q.order_by(desc(Project.message_count), desc(Project.score)).limit(100).all()]
+    if not cards and include != "all":
+        # First visit (or never discovered): look for projects now instead of showing an empty page and waiting for the scheduler.
+        discovered = db.query(User.projects_discovered_at).filter_by(id=user.id).scalar()
+        has_messages = db.query(SlackMessage.id).filter(SlackMessage.owner_id == user.id, SlackMessage.is_deleted.is_(False)).first() is not None
+        if has_messages and discovered is None:
+            job = projects.enqueue_discovery(db, user.id)
+            db.commit()
+            if job is not None:
+                _run_queue_here(background, db)
+    return cards
 
 
 @router.get("/projects/{project_id}")
@@ -167,19 +201,23 @@ def _expensive(user: User) -> None:
 
 
 @router.post("/projects/discover")
-def rediscover(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def rediscover(background: BackgroundTasks, user: User = Depends(current_user), db: Session = Depends(get_db)):
     _expensive(user)
     job = projects.enqueue_discovery(db, user.id)
     db.commit()
-    return {"ok": True, "queued": job is not None, "note": "The worker finds projects after your latest messages finish ingesting."}
+    runner = _run_queue_here(background, db) if job is not None else "queued"
+    return {"ok": True, "queued": job is not None, "processing": runner,
+            "note": "Looking through your recent messages now. New projects appear here in a few seconds."}
 
 
 @router.post("/projects/{project_id}/summarize")
-def summarize_now(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def summarize_now(project_id: int, background: BackgroundTasks, user: User = Depends(current_user), db: Session = Depends(get_db)):
     p = _own(db, user, project_id)
     _expensive(user)
     job = projects.enqueue_summary(db, p.id, force=True)
     db.commit()
+    if job is not None:
+        _run_queue_here(background, db)
     return {"ok": True, "queued": job is not None}
 
 

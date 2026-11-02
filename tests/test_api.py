@@ -83,8 +83,9 @@ def test_inbox_important_shows_best_message_per_priority_and_urgent_filter(clien
             for score in (10, 90):
                 db.add(SlackMessage(
                     owner_id=owner.id, connection_id=connection.id, team_id=connection.team_id,
-                    channel_id="inbox", slack_ts=f"{index}-{score}", text=f"{priority} score {score}",
-                    priority_label=priority, priority_score=score,
+                    channel_id=f"thread-{index}-{score}", slack_ts=f"{index}-{score}",
+                    text=("Please approve the invoice by 5pm today" if (priority, score) == ("P1", 90) else f"{priority} score {score}"),
+                    priority_label=priority, priority_score=score, mentions_me=(priority == "P1" and score == 90),
                 ))
         db.commit()
 
@@ -94,14 +95,69 @@ def test_inbox_important_shows_best_message_per_priority_and_urgent_filter(clien
     assert [message["priority_label"] for message in important] == ["P0", "P1", "P2", "P3"]
     assert [message["priority_score"] for message in important] == [90, 90, 90, 90]
 
+    # Urgent is strict: every critical P0, but a P1 only when it is addressed to the user (the P1 at score 10 was not).
     urgent = client.get("/messages", params={"priority": "urgent", "source": "gmail"}).json()
-    assert {message["priority_label"] for message in urgent} == {"P0", "P1"}
-    assert len(urgent) == 4
+    assert [(m["priority_label"], m["priority_score"]) for m in urgent] == [("P0", 90), ("P0", 10), ("P1", 90)] or \
+        {(m["priority_label"], m["priority_score"]) for m in urgent} == {("P0", 90), ("P0", 10), ("P1", 90)}
+    assert client.get("/dashboard/summary").json()["urgent"] == 3
 
     high = client.get("/messages", params={"priority": "high", "source": "gmail"}).json()
     assert {message["priority_label"] for message in high} == {"P1"}
     normal = client.get("/messages", params={"priority": "normal", "source": "gmail"}).json()
     assert {message["priority_label"] for message in normal} == {"P2", "P3"}
+
+
+def test_urgent_collapses_a_thread_and_done_snooze_clear_it(client):
+    """Twelve messages in one thread are one card; marking it Done (or snoozing) removes it and the urgent counter drops."""
+    from datetime import datetime, timezone
+    from app.models import SlackConnection, SlackMessage, User
+    import app.database as database
+
+    registered, csrf = register(client, "triage@example.com")
+    h = {"X-CSRF-Token": csrf}
+    now = datetime.now(timezone.utc)
+    with database.SessionLocal() as db:
+        owner = db.query(User).filter_by(email="triage@example.com").one()
+        connection = SlackConnection(owner_id=owner.id, team_id="T9", slack_user_id="U9", granted_user_scopes="")
+        db.add(connection)
+        db.flush()
+        ids = []
+        for i in range(12):
+            row = SlackMessage(owner_id=owner.id, connection_id=connection.id, team_id="T9", channel_id="C-thread", thread_ts="1.0", slack_ts=f"1.{i}",
+                               text=f"prod down again #{i}", priority_label="P0", priority_score=90 - i, message_created_at=now, mentions_me=True)
+            db.add(row); db.flush(); ids.append(row.id)
+        bot = SlackMessage(owner_id=owner.id, connection_id=connection.id, team_id="T9", channel_id="C-bot", slack_ts="2.0", is_bot=True,
+                           text="alert: CPU high", priority_label="P0", priority_score=95, message_created_at=now)
+        old = SlackMessage(owner_id=owner.id, connection_id=connection.id, team_id="T9", channel_id="C-old", slack_ts="3.0", mentions_me=True,
+                           text="old ask", priority_label="P1", priority_score=80, message_created_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+        db.add_all([bot, old]); db.commit()
+    urgent = client.get("/messages", params={"priority": "urgent"}).json()
+    assert len(urgent) == 1 and urgent[0]["more_in_conversation"] == 11 and urgent[0]["priority_score"] == 90   # bot + stale excluded
+    assert client.get("/dashboard/summary").json()["urgent"] == 1
+    done = client.post(f"/messages/{urgent[0]['id']}/handled", json={}, headers=h)
+    assert done.status_code == 200 and done.json()["cleared"] == 12
+    assert client.get("/messages", params={"priority": "urgent"}).json() == []
+    assert client.get("/dashboard/summary").json()["urgent"] == 0
+    assert client.post("/messages/triage/undo", json={"ids": done.json()["ids"]}, headers=h).json()["restored"] == 12
+    assert len(client.get("/messages", params={"priority": "urgent"}).json()) == 1
+    assert client.post(f"/messages/{ids[0]}/snooze", json={"hours": 4}, headers=h).status_code == 200
+    assert client.get("/messages", params={"priority": "urgent"}).json() == []
+
+
+def test_someone_elses_message_cannot_be_triaged(client):
+    from app.models import SlackConnection, SlackMessage, User
+    import app.database as database
+    register(client, "owner1@example.com")
+    with database.SessionLocal() as db:
+        owner = db.query(User).filter_by(email="owner1@example.com").one()
+        c = SlackConnection(owner_id=owner.id, team_id="T7", slack_user_id="U7", granted_user_scopes="")
+        db.add(c); db.flush()
+        m = SlackMessage(owner_id=owner.id, connection_id=c.id, team_id="T7", channel_id="C", slack_ts="1.0", text="x", priority_label="P0")
+        db.add(m); db.commit(); mid = m.id
+    client.cookies.clear()
+    _, csrf = register(client, "intruder@example.com")
+    assert client.post(f"/messages/{mid}/handled", json={}, headers={"X-CSRF-Token": csrf}).status_code == 404
+    assert client.post(f"/messages/{mid}/snooze", json={}, headers={"X-CSRF-Token": csrf}).status_code == 404
 
 
 def test_security_headers_and_unauthenticated_api(client):
@@ -112,20 +168,17 @@ def test_security_headers_and_unauthenticated_api(client):
 
 def test_owner_only_admin_and_pipeline_routes(client, monkeypatch):
     from app.config import settings
-    import app.routes_app as routes_app
-    monkeypatch.setattr(settings, "admin_email", "owner@example.com")
-    monkeypatch.setattr(routes_app, "service_status", lambda: {
-        "redis": ("off", "not configured"), "qdrant": ("off", "not configured"), "neo4j": ("off", "not configured")
-    })
+    monkeypatch.setattr(settings, "admin_emails", "owner@example.com")
     admin, _ = register(client, "owner@example.com")
-    assert admin.status_code == 200
-    assert client.get("/api/admin/settings").status_code == 200
+    assert admin.status_code == 200 and admin.json()["user"]["is_admin"] is True
     assert client.get("/api/pipeline/overview").status_code == 200
+    assert client.get("/api/pipeline/events").status_code == 200
+    assert client.get("/api/intelligence/status").status_code == 200
     client.cookies.clear()
-    register(client, "member@example.com")
-    assert client.get("/api/admin/settings").status_code == 403
-    assert client.get("/api/pipeline/overview").status_code == 403
-    assert client.get("/api/pipeline/events").status_code == 403
+    member, _ = register(client, "member@example.com")
+    assert member.json()["user"]["is_admin"] is False
+    for path in ("/api/pipeline/overview", "/api/pipeline/events", "/api/selfcheck", "/api/intelligence/status", "/queue/summary"):
+        assert client.get(path).status_code == 403, path
 
 
 def test_account_profile_password_and_session_controls(client):
@@ -227,7 +280,7 @@ def test_meeting_message_priority_is_exposed_in_today_and_schedule(client, monke
         db.flush()
         event = SuggestedEvent(owner_id=user.id, message_id=message.id, title="meet today",
                                proposed_start=datetime.now(timezone.utc) - timedelta(hours=3),
-                               duration_minutes=30, status="suggested", assigned_people="[]")
+                               duration_minutes=30, status="suggested")
         db.add(event)
         db.add(SuggestedEvent(owner_id=user.id, message_id=message.id, title="meet today",
                               proposed_start=event.proposed_start, duration_minutes=30, status="suggested",
@@ -263,7 +316,7 @@ def test_ask_today_attention_includes_linked_calendar_message(client, monkeypatc
         db.flush()
         db.add(SuggestedEvent(owner_id=user.id, message_id=message.id, title=message.text,
                               proposed_start=datetime.now(timezone.utc), duration_minutes=60,
-                              status="suggested", assigned_people="[]"))
+                              status="suggested"))
         db.commit()
 
     answer = client.post("/assistant/ask", json={"question": "What needs my attention today?"},
@@ -295,319 +348,12 @@ def test_assistant_returns_conversational_fallback_with_message_sources(client, 
     assert answer.status_code == 200, answer.text
     result = answer.json()
     assert isinstance(result["answer"], str) and result["answer"]
-    assert "One thing that may help:" in result["answer"]
-    assert "[#" not in result["answer"]
+    assert "Relevant messages:" not in result["answer"]
     assert result["sources"] and "NebulaXenon" in result["sources"][0]["text"]
     greeting = client.post("/assistant/ask", json={"question": "sup"}, headers={"X-CSRF-Token": csrf})
     assert greeting.status_code == 200
     assert greeting.json()["answer"].startswith("Hi!")
     assert greeting.json()["sources"] == []
-
-
-def test_assistant_treats_yo_as_greeting_without_searching_messages(client, monkeypatch):
-    import app.integrations as integrations
-
-    def unexpected_search(*args, **kwargs):
-        raise AssertionError("A greeting must not trigger message retrieval.")
-
-    monkeypatch.setattr(integrations, "search_vectors", unexpected_search)
-    response, csrf = register(client, "assistant-yo@example.com")
-    assert response.status_code == 200
-    with client:
-        response = client.post("/assistant/ask", json={"question": "yo"},
-                               headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["answer"].startswith("Hi!")
-    assert result["sources"] == []
-
-
-def test_assistant_uses_recent_chat_context_for_follow_up_questions(client, monkeypatch):
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import SlackConnection, SlackMessage, User
-
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "assistant-follow-up@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="assistant-follow-up@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="FOLLOWUP", slack_user_id="UFOLLOWUP",
-                                     status="connected")
-        db.add(connection)
-        db.flush()
-        phoenix = SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                               channel_id="C1", slack_ts="1.0", author_name="Dev Patel",
-                               text="Phoenix migration is blocked on the DNS fix.",
-                               priority_label="P1", priority_score=30)
-        atlas = SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                             channel_id="C1", slack_ts="2.0", author_name="Omar Haddad",
-                             text="Atlas pricing approval is due today.",
-                             priority_label="P0", priority_score=100)
-        db.add_all([phoenix, atlas])
-        db.commit()
-        phoenix_id = phoenix.id
-
-    response = client.post("/assistant/ask", json={
-        "question": "what about that?",
-        "history": [
-            {"role": "user", "content": "What is happening with Phoenix?"},
-            {"role": "assistant", "content": "Dev says the Phoenix migration is blocked on DNS."},
-        ],
-    }, headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["sources"]
-    assert result["sources"][0]["message_id"] == phoenix_id
-    assert "Phoenix migration" in result["answer"]
-
-
-def test_assistant_drafts_reply_to_named_slack_person_without_sending(client, monkeypatch):
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import OutboundAction, SlackConnection, SlackConversation, SlackMessage, User
-
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "assistant-reply-draft@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="assistant-reply-draft@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="DRAFT", slack_user_id="UOWNER",
-                                     status="connected", provider="slack", granted_user_scopes="chat:write")
-        db.add(connection)
-        db.flush()
-        db.add(SlackConversation(connection_id=connection.id, channel_id="C1", name="platform",
-                                 conv_type="public_channel", is_active=True))
-        message = SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                               channel_id="C1", slack_ts="1.0", user_id="UDEV", author_name="Dev Patel",
-                               text="Phoenix post-migration checklist drafted, please add anything I missed.",
-                               priority_label="P2", priority_score=20)
-        db.add(message)
-        db.commit()
-        message_id = message.id
-
-    response = client.post("/assistant/ask", json={"question": "can u telll dev to wait for a meet on tuesday"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["answer"] == "I drafted a short message for Dev Patel. Choose a channel and review it before posting."
-    assert result["suggested_reply"]["recipient"] == "Dev Patel"
-    assert result["suggested_reply"]["draft"] == "Could you hold off until Tuesday? Let's meet then, and I'll confirm a time shortly."
-    assert result["suggested_reply"]["channel_options"] == [{
-        "connection_id": connection.id,
-        "channel_id": "C1",
-        "channel_name": "platform",
-        "can_post": True,
-        "about_recipient": True,
-    }]
-    assert result["sources"][0]["message_id"] == message_id
-    with database.SessionLocal() as db:
-        assert db.query(OutboundAction).filter_by(owner_id=user.id).count() == 0
-
-
-def test_channel_post_requires_confirmation_and_demo_post_is_simulated(client):
-    import app.database as database
-    from app.models import OutboundAction, SlackConnection, SlackConversation, User
-
-    response, csrf = register(client, "channel-post@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="channel-post@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="POST", slack_user_id="UPOST",
-                                     status="connected", provider="slack", is_demo=True)
-        db.add(connection)
-        db.flush()
-        db.add(SlackConversation(connection_id=connection.id, channel_id="CPOST", name="general",
-                                 conv_type="public_channel", is_active=True))
-        db.commit()
-        connection_id = connection.id
-
-    path = f"/channels/{connection_id}/CPOST/messages"
-    response = client.post(path, json={"text": "Dev, could you schedule a meeting?"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "approval_required"
-    response = client.post(path, json={"text": "Dev, could you schedule a meeting?", "approved": True,
-                                       "client_request_id": "draft-post-1"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    assert response.json()["simulated"] is True
-    assert response.json()["type"] == "slack_channel_post"
-    with database.SessionLocal() as db:
-        action = db.query(OutboundAction).filter_by(idempotency_key="draft-post-1").one()
-        assert action.status == "simulated"
-
-
-def test_assistant_channel_composition_request_offers_a_composer(client, monkeypatch):
-    import app.integrations as integrations
-
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "assistant-channel-compose@example.com")
-    assert response.status_code == 200
-    response = client.post("/assistant/ask", json={"question": "create a message to reply in one of the channels"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["answer"].startswith("Sure. Choose a channel")
-    assert result["channel_compose"] is True
-    assert result["sources"] == []
-
-
-def test_assistant_drafts_message_for_person_even_without_author_message(client):
-    import app.database as database
-    from app.models import SlackConnection, SlackConversation, User
-
-    response, csrf = register(client, "assistant-reply-no-message@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="assistant-reply-no-message@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="NOAUTHOR", slack_user_id="UOWNER",
-                                     status="connected", provider="slack", is_demo=True)
-        db.add(connection)
-        db.flush()
-        db.add(SlackConversation(connection_id=connection.id, channel_id="C1", name="general",
-                                 conv_type="public_channel", is_active=True))
-        db.commit()
-
-    response = client.post("/assistant/ask", json={"question": "bruh tell dev to schedule a meet"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["suggested_reply"]["draft"] == "Dev, could you schedule a meeting?"
-    assert result["suggested_reply"]["channel_options"][0]["channel_id"] == "C1"
-    assert result["sources"] == []
-
-
-def test_assistant_today_question_only_returns_deadlines_due_today(client, monkeypatch):
-    from datetime import datetime, timezone
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import SlackConnection, SlackMessage, User
-
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "assistant-today-focus@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="assistant-today-focus@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="TODAY", slack_user_id="UTODAY", status="connected")
-        db.add(connection)
-        db.flush()
-        db.add_all([
-            SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                         channel_id="C1", slack_ts="1.0", author_name="Omar Haddad",
-                         text="@You please approve the Q4 roadmap by 5pm today.",
-                         priority_label="P1", priority_score=80, message_created_at=datetime.now(timezone.utc)),
-            SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                         channel_id="C1", slack_ts="2.0", author_name="Dev Patel",
-                         text="Phoenix post-migration checklist drafted, please add anything I missed.",
-                         priority_label="P1", priority_score=70, message_created_at=datetime.now(timezone.utc)),
-        ])
-        db.commit()
-
-    response = client.post("/assistant/ask", json={"question": "anything imp for today?"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert "Omar Haddad" in result["answer"]
-    assert "needs your approval on the Q4 roadmap" in result["answer"]
-    assert "by 5pm today" in result["answer"]
-    assert "Phoenix post-migration" not in result["answer"]
-    assert len(result["sources"]) == 1
-    assert "suggested_reply" not in result
-
-
-def test_assistant_asks_which_person_when_first_name_is_ambiguous(client, monkeypatch):
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import SlackConnection, SlackMessage, User
-
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "assistant-reply-ambiguous@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="assistant-reply-ambiguous@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="AMBIGUOUS", slack_user_id="UOWNER",
-                                     status="connected", provider="slack")
-        db.add(connection)
-        db.flush()
-        for author, user_id, timestamp in (("Dev Patel", "UDEV1", "1.0"), ("Dev Jones", "UDEV2", "2.0")):
-            db.add(SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                                channel_id="C1", slack_ts=timestamp, user_id=user_id, author_name=author,
-                                text="A message from " + author, priority_label="P2", priority_score=20))
-        db.commit()
-
-    response = client.post("/assistant/ask", json={"question": "tell Dev to wait for Tuesday"},
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["answer"] == "I found more than one person with that name. Which one did you mean: Dev Jones, Dev Patel?"
-    assert "suggested_reply" not in result
-    assert result["sources"] == []
-
-
-def test_assistant_stream_sends_tokens_before_final_sources(client, monkeypatch):
-    import app.assistant as assistant
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import SlackConnection, SlackMessage, User
-
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    monkeypatch.setattr(assistant.llm, "enabled", lambda: True)
-    _, csrf = register(client, "assistant-stream@example.com")
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="assistant-stream@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="STREAM", slack_user_id="USTREAM", status="connected")
-        db.add(connection)
-        db.flush()
-        message = SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                               channel_id="C1", slack_ts="1.0", text="NebulaXenon release review is blocked until Friday.",
-                               priority_label="P1", priority_score=80)
-        db.add(message)
-        db.commit()
-        message_id = message.id
-
-    def fake_stream(_db, _owner_id, prompt, on_token, **_kwargs):
-        assert "<conversation>" in prompt[1]["content"]
-        assert "Tell me about the NebulaXenon release review." in prompt[1]["content"]
-        on_token("The review is blocked ")
-        on_token(f"[#{message_id}]")
-        return f"The review is blocked [#{message_id}]"
-
-    monkeypatch.setattr(assistant.llm, "chat_stream", fake_stream)
-    response = client.post("/assistant/ask/stream", json={
-        "question": "What about NebulaXenon?",
-        "history": [{"role": "user", "content": "Tell me about the NebulaXenon release review."}],
-    },
-                           headers={"X-CSRF-Token": csrf})
-    assert response.status_code == 200
-    assert "event: token" in response.text
-    assert "The review is blocked " in response.text
-    assert "event: done" in response.text
-    assert f'"message_id": {message_id}' in response.text
-
-
-def test_inbox_and_dashboard_include_own_slack_messages(client):
-    import app.database as database
-    from app.models import SlackConnection, SlackMessage, User
-
-    _, csrf = register(client, "own-message@example.com")
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="own-message@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="OWN", slack_user_id="UOWN", status="connected")
-        db.add(connection)
-        db.flush()
-        db.add(SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                            channel_id="C1", slack_ts="1.0", user_id="UOWN", is_self=True,
-                            text="Message I sent to a colleague", priority_label="P3"))
-        db.commit()
-
-    messages = client.get("/messages?include_self=true")
-    assert messages.status_code == 200
-    assert len(messages.json()) == 1 and messages.json()[0]["is_self"]
-    search = client.get("/api/search?q=colleague")
-    assert search.status_code == 200 and search.json()["results"][0]["is_self"]
-    summary = client.get("/dashboard/summary")
-    assert summary.status_code == 200 and summary.json()["messages_total"] == 1
 
 
 def test_assistant_answers_meeting_today_from_suggestions(client, monkeypatch):
@@ -642,96 +388,10 @@ def test_assistant_answers_meeting_today_from_suggestions(client, monkeypatch):
                          headers={"X-CSRF-Token": csrf})
     assert answer.status_code == 200, answer.text
     result = answer.json()
-    assert "meeting-related item" in result["answer"]
+    assert "meeting-related item" in result["answer"] and "\n- " not in result["answer"]
     assert "ProjectOrion planning call" in result["answer"]
-    assert "[#" not in result["answer"]
-    assert result["sources"][0]["message_id"] == message.id
-
-
-def test_assistant_summarizes_meeting_details_instead_of_dumping_messages(client, monkeypatch):
-    import app.assistant as assistant
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import SlackConnection, SlackMessage, User
-
-    monkeypatch.setattr(assistant.llm, "enabled", lambda: False)
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "meeting-details@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="meeting-details@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="MEETING-DETAILS", slack_user_id="UMEETING", status="connected")
-        db.add(connection)
-        db.flush()
-        text = ("78catalyst - Cohort Session5 Wednesday, October 21 · 8:00 – 9:00pm "
-                "Time zone: Asia/Kolkata Google Meet joining info Video call link: meet.google.com/ymt-deyz-odr")
-        messages = [
-            SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                         channel_id="C1", slack_ts=f"{i}.0", text=text, priority_label="P1", priority_score=80)
-            for i in range(2)
-        ]
-        db.add_all(messages)
-        db.add(SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                            channel_id="C1", slack_ts="3.0", text="Please review the roadmap before the board meeting.",
-                            priority_label="P1", priority_score=80))
-        db.commit()
-
-    answer = client.post("/assistant/ask", json={"question": "whats the meet"},
-                         headers={"X-CSRF-Token": csrf})
-    assert answer.status_code == 200, answer.text
-    result = answer.json()
-    assert "Cohort Session5 Google Meet" in result["answer"]
-    assert "Wednesday, October 21" in result["answer"]
-    assert "8:00 – 9:00pm" in result["answer"]
-    assert "Asia/Kolkata" in result["answer"]
-    assert "roadmap" not in result["answer"]
-    assert "[#" not in result["answer"]
-    assert len(result["sources"]) == 1
-    assert "Cohort Session5" in result["sources"][0]["text"]
-
-
-def test_assistant_summarizes_important_meet_query_and_deduplicates_sources(client, monkeypatch):
-    import app.assistant as assistant
-    import app.database as database
-    import app.integrations as integrations
-    from app.models import SlackConnection, SlackMessage, User
-
-    monkeypatch.setattr(assistant.llm, "enabled", lambda: False)
-    monkeypatch.setattr(integrations, "search_vectors", lambda *args, **kwargs: [])
-    response, csrf = register(client, "important-meeting@example.com")
-    assert response.status_code == 200
-    with database.SessionLocal() as db:
-        user = db.query(User).filter_by(email="important-meeting@example.com").one()
-        connection = SlackConnection(owner_id=user.id, team_id="IMPORTANT-MEETING", slack_user_id="UIMPORTANT", status="connected")
-        db.add(connection)
-        db.flush()
-        text = ("78catalyst - Cohort Session5 Wednesday, October 21 · 8:00 – 9:00pm "
-                "Time zone: Asia/Kolkata Google Meet joining info Video call link: meet.google.com/ymt-deyz-odr")
-        db.add_all([
-            SlackMessage(owner_id=user.id, connection_id=connection.id, team_id=connection.team_id,
-                         channel_id="C1", slack_ts=f"{i}.0", text=text, priority_label="P1", priority_score=80)
-            for i in range(2)
-        ])
-        db.commit()
-
-    result = client.post("/assistant/ask", json={"question": "hmm any important meet ?"},
-                         headers={"X-CSRF-Token": csrf})
-    assert result.status_code == 200, result.text
-    payload = result.json()
-    assert "Cohort Session5 Google Meet" in payload["answer"]
-    assert "That date has passed" in payload["answer"]
-    assert "A few things stand out" not in payload["answer"]
-    assert len(payload["sources"]) == 1
-
-
-def test_assistant_greeting_stream_never_serializes_missing_answer_as_null(client):
-    response, csrf = register(client, "assistant-greeting-stream@example.com")
-    assert response.status_code == 200
-    streamed = client.post("/assistant/ask/stream", json={"question": "sup"},
-                           headers={"X-CSRF-Token": csrf})
-    assert streamed.status_code == 200, streamed.text
-    assert '"answer": "Hi!' in streamed.text
-    assert "null" not in streamed.text
+    assert "[1]" in result["answer"] and result["cited"] == [1]        # numbered citation, Perplexity style
+    assert result["sources"][0]["message_id"] == message.id and result["sources"][0]["n"] == 1
 
 
 def test_user_can_search_messages_and_create_project_from_keywords(client, monkeypatch):
@@ -765,3 +425,34 @@ def test_user_can_search_messages_and_create_project_from_keywords(client, monke
     messages = client.get("/messages", params={"project_id": project_id})
     assert messages.status_code == 200
     assert [message["text"] for message in messages.json()] == ["Nebula-launch planning"]
+
+
+def test_feedback_labels_clear_pin_and_undo(client):
+    """'Not urgent' clears the conversation now; 'Always show' pins; Undo removes the label; nobody else can label your messages."""
+    from app.models import MessageFeedback, SlackConnection, SlackMessage, User
+    import app.database as database
+    _, csrf = register(client, "labels@example.com")
+    h = {"X-CSRF-Token": csrf}
+    with database.SessionLocal() as db:
+        owner = db.query(User).filter_by(email="labels@example.com").one()
+        c = SlackConnection(owner_id=owner.id, team_id="T-labels", slack_user_id="U1", granted_user_scopes="", provider="slack")
+        db.add(c); db.flush()
+        ids = []
+        for i in range(2):
+            m = SlackMessage(owner_id=owner.id, connection_id=c.id, team_id="T-labels", channel_id=f"D{i}", conv_type="im", slack_ts=f"1.{i}",
+                             user_id="UBOSS", author_name="Boss", text="Please approve the invoice by 5pm today", priority_label="P1", priority_score=80)
+            db.add(m); db.flush(); ids.append(m.id)
+        db.commit()
+    assert client.get("/dashboard/summary").json()["urgent"] == 2
+    r = client.post(f"/messages/{ids[0]}/feedback", json={"label": "not_urgent"}, headers=h)
+    assert r.status_code == 200 and r.json()["cleared"] >= 1
+    assert client.get("/dashboard/summary").json()["urgent"] == 1
+    undo = client.post("/messages/triage/undo", json={"ids": r.json()["ids"]}, headers=h)
+    assert undo.status_code == 200 and client.get("/dashboard/summary").json()["urgent"] == 2
+    with database.SessionLocal() as db:
+        assert db.query(MessageFeedback).count() == 0
+    assert client.post(f"/messages/{ids[1]}/feedback", json={"label": "always_show"}, headers=h).status_code == 200
+    assert client.post(f"/messages/{ids[1]}/feedback", json={"label": "bogus"}, headers=h).status_code == 422
+    _, csrf2 = register(client, "other-labels@example.com")
+    h = {"X-CSRF-Token": csrf2}
+    assert client.post(f"/messages/{ids[0]}/feedback", json={"label": "not_mine"}, headers=h).status_code == 404

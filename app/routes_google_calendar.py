@@ -63,14 +63,6 @@ def connection_status(user: User = Depends(current_user), db: Session = Depends(
     }
 
 
-@router.get("/events/today")
-def today_events(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    try:
-        return {"events": google_calendar.events_today(db, user.id) or []}
-    except google_calendar.GoogleCalendarError as exc:
-        raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
-
-
 @router.post("/disconnect")
 def disconnect(user: User = Depends(current_user), db: Session = Depends(get_db)):
     conn = google_calendar.get_connection(db, user.id)

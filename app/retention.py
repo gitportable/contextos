@@ -22,8 +22,7 @@ from sqlalchemy.orm import Session
 
 from app import integrations, pipeline_events, projects
 from app.config import settings
-from app.item_sources import detach_message_sources
-from app.models import ItemEvent, MessageProject, OutboundAction, Reminder, SlackMessage, SuggestedEvent, utcnow
+from app.models import MessageFeedback, MessageProject, MessageState, OutboundAction, Reminder, SlackMessage, SuggestedEvent, utcnow
 
 log = logging.getLogger("contextos.retention")
 CHUNK = 500
@@ -36,8 +35,8 @@ def delete_messages(db: Session, ids: list[int]) -> int:
     for i in range(0, len(ids), CHUNK):
         chunk = ids[i:i + CHUNK]
         db.query(MessageProject).filter(MessageProject.message_id.in_(chunk)).delete(synchronize_session=False)
-        detach_message_sources(db, chunk)
-        db.query(ItemEvent).filter(ItemEvent.message_id.in_(chunk)).update({"message_id": None}, synchronize_session=False)
+        db.query(MessageState).filter(MessageState.message_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(MessageFeedback).filter(MessageFeedback.message_id.in_(chunk)).delete(synchronize_session=False)
         db.query(Reminder).filter(Reminder.message_id.in_(chunk)).update({"message_id": None}, synchronize_session=False)
         db.query(SuggestedEvent).filter(SuggestedEvent.message_id.in_(chunk)).update({"message_id": None}, synchronize_session=False)
         db.query(OutboundAction).filter(OutboundAction.message_id.in_(chunk)).update({"message_id": None}, synchronize_session=False)

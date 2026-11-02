@@ -1,5 +1,6 @@
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -131,9 +132,14 @@ class Settings(BaseSettings):
     summary_interval_minutes: int = 30
 
     # --- who may open the Pipeline page / operational endpoints ---------------
-    # Comma-separated e-mail addresses. In production an admin must also have a Google-verified address.
-    # Empty: in development the FIRST account created is the admin; in production nobody is (and startup warns).
-    admin_emails: str = ""
+    # Comma-separated e-mail addresses (override with ADMIN_EMAILS in .env). Only these accounts see the Pipeline page,
+    # service status and other operational details; everyone else gets the plain product.
+    # An empty list means nobody is an admin (there is no "first account wins" fallback any more).
+    admin_emails: str = Field(default="kuch2731@gmail.com", validation_alias=AliasChoices("ADMIN_EMAILS", "ADMIN_EMAIL", "admin_emails"))
+
+    # --- inbox noise control ------------------------------------------------
+    urgent_window_hours: int = 72            # an "urgent" message older than this is no longer urgent, however it scored
+    urgent_max_items: int = 6                # the Urgent view shows at most this many conversations, newest-most-important first
 
     # --- Qdrant / Neo4j driven features (all tunable) -------------------------
     semantic_search_min_score: float = 0.30  # Smart search: minimum cosine similarity for a "by meaning" hit
@@ -165,7 +171,31 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     neo4j_database: str = "neo4j"
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True)
+
+    @field_validator("public_base_url", "slack_redirect_uri", "google_redirect_uri", mode="after")
+    @classmethod
+    def _tidy_url(cls, v: str) -> str:
+        return (v or "").strip().rstrip("/")
+
+    @field_validator("database_url", mode="after")
+    @classmethod
+    def _tidy_database_url(cls, v: str) -> str:
+        """Accept the URL exactly as Supabase / Heroku / Neon show it and make it usable:
+        postgres:// and postgresql:// -> the psycopg2 driver; hosted databases (anything that is not localhost) get
+        sslmode=require unless the URL already says otherwise; stray spaces and a password in [brackets] are cleaned."""
+        v = (v or "").strip()
+        for old in ("postgres://", "postgresql://"):
+            if v.startswith(old):
+                v = "postgresql+psycopg2://" + v[len(old):]
+        if not v.startswith("postgresql"):
+            return v
+        u = urlparse(v)
+        host = (u.hostname or "").lower()
+        if host and host not in ("localhost", "127.0.0.1", "::1", "db", "postgres") and "sslmode" not in u.query:
+            q = parse_qsl(u.query, keep_blank_values=True) + [("sslmode", "require")]
+            v = urlunparse(u._replace(query=urlencode(q)))
+        return v
 
     # --- derived ----------------------------------------------------------
     @property
@@ -254,8 +284,20 @@ class Settings(BaseSettings):
         if not self.neo4j_enabled:
             warn.append("NEO4J_URI is empty: People page, 'who to ask', collaborator boost and dependency warnings fall back to slower PostgreSQL approximations. "
                         "Run `docker compose up -d neo4j` and set NEO4J_URI=bolt://localhost:7687 (+ NEO4J_USER / NEO4J_PASSWORD).")
-        if self.is_production and not self.admin_email_set:
-            warn.append("ADMIN_EMAILS is empty: nobody can open the Pipeline page in production.")
+        db = urlparse(self.database_url)
+        if db.scheme.startswith("postgresql") and (db.hostname or "") not in ("localhost", "127.0.0.1"):
+            if not db.password:
+                fatal.append("DATABASE_URL has no password. Put the real database password after the colon "
+                              "(postgresql://postgres:PASSWORD@host:5432/postgres; URL-encode special characters such as @ as %40).")
+            elif db.password.startswith("[") and db.password.endswith("]"):
+                fatal.append("DATABASE_URL still contains the [YOUR-PASSWORD] placeholder; replace it, without the brackets.")
+            if db.port == 6543:
+                warn.append("DATABASE_URL uses the transaction pooler (port 6543). Use the session pooler or direct connection (port 5432).")
+            if (db.hostname or "").startswith("db.") and (db.hostname or "").endswith(".supabase.co"):
+                warn.append("The direct Supabase host is IPv6-only on free projects. If the connection fails with 'network is unreachable', "
+                            "use the Session pooler string (aws-0-<region>.pooler.supabase.com) instead.")
+        if not self.admin_email_set:
+            warn.append("ADMIN_EMAILS is empty: nobody can open the Pipeline page.")
         if not self.llm_enabled:
             warn.append("LLM_API_KEY is empty: summaries and answers use the extractive (non-LLM) fallback.")
         return [f"FATAL: {m}" for m in fatal] + [f"warning: {m}" for m in warn]

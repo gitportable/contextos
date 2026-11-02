@@ -1,7 +1,18 @@
 """Shared response shapes."""
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
+from app import ranker
+
 from app.models import SlackConnection, SlackConversation, SlackMessage
+
+
+def _why(r: SlackMessage) -> str:
+    """One plain sentence, computed from the message as it is now (so older rows read the same as new ones)."""
+    now = datetime.now(timezone.utc)
+    f = ranker.extract(r.text, r.message_created_at or r.ingested_at, now, is_dm=(r.conv_type == "im"), mentions_me=bool(r.mentions_me), is_bot=bool(r.is_bot))
+    return ranker.explain(f, r.author_name)
 
 
 def message_dicts(db: Session, rows: list[SlackMessage]) -> list[dict]:
@@ -15,7 +26,7 @@ def message_dicts(db: Session, rows: list[SlackMessage]) -> list[dict]:
         out.append({"id": r.id, "connection_id": r.connection_id, "team_id": r.team_id, "channel_id": r.channel_id,
                     "channel_name": (cv.name if cv and cv.name else r.channel_id), "conv_type": r.conv_type, "slack_ts": r.slack_ts,
                     "thread_ts": r.thread_ts, "reply_count": r.reply_count, "user_id": r.user_id, "author_name": r.author_name,
-                    "text": r.text, "priority_score": r.priority_score, "priority_label": r.priority_label, "reason": r.reason,
+                    "text": r.text, "priority_score": r.priority_score, "priority_label": r.priority_label, "reason": _why(r),
                     "is_self": r.is_self, "is_bot": r.is_bot, "mentions_me": r.mentions_me, "is_demo": r.connection_id in demo, "provider": conns[r.connection_id].provider if r.connection_id in conns else "slack",
                     "edited_at": r.edited_at.isoformat() if r.edited_at else None, "source": r.source,
                     "message_created_at": r.message_created_at.isoformat() if r.message_created_at else None,

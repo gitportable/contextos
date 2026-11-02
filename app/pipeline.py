@@ -1,25 +1,27 @@
 """The single ingestion path. Live events, history sync, reconcile and the demo all go through ingest_message(),
-so messages are normalized, structurally scored, and de-duplicated consistently."""
-import json
+so a message is scored, de-duplicated and turned into reminders/suggestions exactly one way."""
 import logging
 from collections import Counter
 from dataclasses import dataclass
+from datetime import timedelta
+
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import integrations, pipeline_events, projects
 from app.config import settings
-from app.item_sources import detach_message_sources
-from app.models import (Item, ItemEvent, ItemSource, MessageProject, OutboundAction, Reminder, SlackConnection,
-                        SlackConversation, SlackMessage, SlackUser, SuggestedEvent, utcnow)
-from app.priority import score_message
+from app.models import (MessageFeedback, MessageProject, MessageState, OutboundAction, Reminder, SlackConnection, SlackConversation, SlackMessage, SlackUser,
+                        SuggestedEvent, utcnow)
+from app import ranker
+from app.priority import extract_meeting_suggestion, extract_reminder_due
 from app.slack_text import (conv_type_from_channel_type, has_broadcast, mentioned_user_ids, mentions_user,
                             normalize_text, ts_to_datetime)
 
 log = logging.getLogger("contextos.pipeline")
 # Slack subtypes that carry real human/bot content. Joins, topic changes, etc. are ignored.
 ALLOWED_SUBTYPES = {None, "thread_broadcast", "file_share", "me_message", "bot_message"}
+STALE_AFTER = timedelta(hours=24)  # don't create reminders that were already overdue by more than a day
 
 
 @dataclass
@@ -65,15 +67,50 @@ def _extract_body(raw: dict) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
+def _is_directed(row: SlackMessage) -> bool:
+    """True when the message is addressed to the connected user (not a bot, not channel chatter)."""
+    if row.is_bot:
+        return False
+    return bool(row.mentions_me) or row.conv_type in ("im", "mpim")
+
+
 def _derive_artifacts(db: Session, row: SlackMessage) -> None:
-    """Retire legacy regex-generated artifacts; message text alone is not confirmation."""
+    """Reminder + meeting suggestion, one of each per message (auto_key), kept in sync on edits/deletes."""
+    created = row.message_created_at or utcnow()
+    now = utcnow()
+
     rem_key = f"auto:{row.id}"
     rem = db.query(Reminder).filter_by(auto_key=rem_key).first()
-    if rem is not None and rem.status == "pending":
+    # Only things aimed at YOU become to-dos or meeting ideas: an @mention, a DM, or an email written to you. A channel
+    # message, a bot alert or a newsletter that happens to contain "today" or "call" is somebody else's business, and
+    # turning each of them into a reminder is what flooded the inbox.
+    directed = _is_directed(row)
+    due = None
+    if directed and not row.is_deleted and not row.is_self:  # your own requests to others are not your to-dos
+        due = extract_reminder_due(row.text, now=created)
+        if due and due < now - STALE_AFTER:
+            due = None
+    if due:
+        title = row.text[:280] or "Follow up from Slack"
+        if rem is None:
+            db.add(Reminder(owner_id=row.owner_id, message_id=row.id, title=title, due_at=due, auto_key=rem_key))
+        elif rem.status == "pending":
+            rem.title, rem.due_at = title, due
+    elif rem is not None and rem.status == "pending":
         rem.status = "cancelled"
 
     ev = db.query(SuggestedEvent).filter_by(auto_key=rem_key).first()
-    if ev is not None and ev.status == "suggested":
+    meeting = None if (row.is_deleted or not directed) else extract_meeting_suggestion(row.text, now=created)
+    if meeting and meeting[1] < now - timedelta(hours=1):
+        meeting = None
+    if meeting:
+        title, start, provisional = meeting
+        if ev is None:
+            db.add(SuggestedEvent(owner_id=row.owner_id, message_id=row.id, title=title, proposed_start=start, duration_minutes=30,
+                                  is_provisional=provisional, source_text=row.text, auto_key=rem_key))
+        elif ev.status == "suggested":
+            ev.title, ev.proposed_start, ev.is_provisional, ev.source_text = title, start, provisional, row.text
+    elif ev is not None and ev.status == "suggested":
         ev.status = "cancelled"
 
 
@@ -133,7 +170,7 @@ def ingest_message(db: Session, conn: SlackConnection, channel_id: str, raw: dic
             return IngestResult("duplicate", existing)
         existing.raw_text, existing.text, existing.edited_at, existing.compacted_at = raw_text, text, edited_at, None
         existing.author_name = author_name or existing.author_name
-        _rescore(existing, conn, conv, raw_text, bool(raw.get("_direct")), has_attachment=bool(raw.get("files") or raw.get("attachments")))
+        _rescore(existing, conn, conv, raw_text, bool(raw.get("_direct")), db)
         _derive_artifacts(db, existing)
         db.flush()
         return IngestResult("updated", existing)
@@ -143,7 +180,7 @@ def ingest_message(db: Session, conn: SlackConnection, channel_id: str, raw: dic
         slack_ts=ts, thread_ts=thread_ts, reply_count=reply_count, user_id=author, author_name=author_name, text=text,
         raw_text=raw_text, is_self=is_self, is_bot=is_bot, source=source, source_event_id=event_id,
         message_created_at=ts_to_datetime(ts), edited_at=edited_at)
-    _rescore(row, conn, conv, raw_text, bool(raw.get("_direct")), has_attachment=bool(raw.get("files") or raw.get("attachments")))
+    _rescore(row, conn, conv, raw_text, bool(raw.get("_direct")), db)
     try:
         with db.begin_nested():
             db.add(row)
@@ -157,21 +194,20 @@ def ingest_message(db: Session, conn: SlackConnection, channel_id: str, raw: dic
     return IngestResult("created", row)
 
 
-def _rescore(row: SlackMessage, conn: SlackConnection, conv: SlackConversation, raw_text: str, direct: bool = False,
-             *, has_attachment: bool = False) -> None:
+def _rescore(row: SlackMessage, conn: SlackConnection, conv: SlackConversation, raw_text: str, direct: bool = False, db=None) -> None:
     if conv.conv_type == "email":  # an email written to me personally (not a list/newsletter) counts like an @mention
         row.mentions_me = direct and not row.is_self
-        score, label, reason = score_message(
-            is_dm=False, mentions_me=row.mentions_me, broadcast=False, is_bot=row.is_bot, is_self=row.is_self,
-            reply_count=row.reply_count, has_attachment=has_attachment)
-        row.priority_score, row.priority_label, row.reason = score, label, reason
+        _apply_rank(row, db, is_dm=False, mentions_me=row.mentions_me, is_bot=row.is_bot)
         return
     row.mentions_me = mentions_user(raw_text, conn.slack_user_id)
-    score, label, reason = score_message(
-        is_dm=(conv.conv_type == "im" and not row.is_self), mentions_me=row.mentions_me and not row.is_self,
-        broadcast=has_broadcast(raw_text), is_bot=row.is_bot, is_self=row.is_self,
-        reply_count=row.reply_count, has_attachment=has_attachment)
-    row.priority_score, row.priority_label, row.reason = score, label, reason
+    _apply_rank(row, db, is_dm=(conv.conv_type == "im" and not row.is_self), mentions_me=row.mentions_me and not row.is_self, is_bot=row.is_bot)
+
+
+def _apply_rank(row: SlackMessage, db, *, is_dm: bool, mentions_me: bool, is_bot: bool) -> None:
+    shifts = ranker.sender_shifts(db, row.owner_id) if db is not None else {}
+    row.priority_score, row.priority_label, row.reason = ranker.rank_message(
+        row.text, row.message_created_at, row.author_name, is_dm=is_dm, mentions_me=mentions_me, is_bot=is_bot,
+        sender_shift=shifts.get(ranker.sender_key(row), 0.0))
 
 
 def apply_deletion(db: Session, conn: SlackConnection, channel_id: str, ts: str) -> IngestResult:
@@ -181,7 +217,6 @@ def apply_deletion(db: Session, conn: SlackConnection, channel_id: str, ts: str)
     if row.is_deleted:
         return IngestResult("duplicate", row, "already deleted")
     row.is_deleted = True
-    detach_message_sources(db, [row.id])
     _derive_artifacts(db, row)  # cancels pending auto reminder/suggestion
     db.flush()
     return IngestResult("deleted", row)
@@ -244,7 +279,7 @@ def log_batch(db: Session, conn: SlackConnection, rows: list[SlackMessage], *, f
     pipeline_events.record(db, "scored", "ok", owner_id=conn.owner_id, trace_id=trace_id,
                            detail=f"{label}: " + " ".join(f"{k}={pr.get(k, 0)}" for k in ("P0", "P1", "P2", "P3")))
     pipeline_events.record(db, "extracted", "ok" if (rem or mt) else "skipped", owner_id=conn.owner_id, trace_id=trace_id,
-                           detail=f"{label}: {rem} legacy/manual reminder(s), {mt} legacy/manual meeting suggestion(s)")
+                           detail=f"{label}: {rem} reminder(s), {mt} meeting suggestion(s)")
 
 
 def link_and_log(db: Session, rows: list[SlackMessage], *, trace_id: str | None = None) -> None:
@@ -266,30 +301,15 @@ def link_and_log(db: Session, rows: list[SlackMessage], *, trace_id: str | None 
 
 
 def purge_connection_data(db: Session, conn: SlackConnection) -> int:
-    """Delete a connection's messages, derived records, items, feedback events, conversations, and index entries."""
+    """Delete everything imported through a connection (messages, derived reminders/suggestions, conversations, index entries)."""
     ids = [i for (i,) in db.query(SlackMessage.id).filter(SlackMessage.connection_id == conn.id).all()]
-    item_ids = {i for (i,) in db.query(Item.id).filter(Item.connection_id == conn.id).all()}
-    item_ids.update(i for (i,) in db.query(ItemSource.item_id).filter(ItemSource.connection_id == conn.id).distinct().all())
-    if item_ids:
-        detach_message_sources(db, ids)
-        for item_id in item_ids:
-            remaining = db.query(ItemSource).filter_by(item_id=item_id).all()
-            if remaining:
-                item = db.query(Item).filter_by(id=item_id).first()
-                if item:
-                    remaining_ids = sorted(source.message_id for source in remaining)
-                    item.source_message_ids = json.dumps(remaining_ids, separators=(",", ":"))
-                    remaining_connections = {source.connection_id for source in remaining}
-                    item.connection_id = next(iter(remaining_connections)) if len(remaining_connections) == 1 else None
-            else:
-                db.query(ItemEvent).filter(ItemEvent.item_id == item_id).delete(synchronize_session=False)
-                db.query(Item).filter(Item.id == item_id).delete(synchronize_session=False)
     for i in range(0, len(ids), 500):
         chunk = ids[i:i + 500]
         db.query(MessageProject).filter(MessageProject.message_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(MessageState).filter(MessageState.message_id.in_(chunk)).delete(synchronize_session=False)
+        db.query(MessageFeedback).filter(MessageFeedback.message_id.in_(chunk)).delete(synchronize_session=False)
         db.query(Reminder).filter(Reminder.message_id.in_(chunk)).delete(synchronize_session=False)
         db.query(SuggestedEvent).filter(SuggestedEvent.message_id.in_(chunk)).delete(synchronize_session=False)
-        db.query(ItemEvent).filter(ItemEvent.message_id.in_(chunk)).delete(synchronize_session=False)
         db.query(OutboundAction).filter(OutboundAction.message_id.in_(chunk)).update({"message_id": None}, synchronize_session=False)
         db.query(SlackMessage).filter(SlackMessage.id.in_(chunk)).delete(synchronize_session=False)
     if ids:

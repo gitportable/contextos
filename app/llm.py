@@ -94,11 +94,11 @@ _THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
 def chat(db: Session, owner_id: int, messages: list[dict], *, max_tokens: int = 700, json_mode: bool = False,
-         transport: httpx.BaseTransport | None = None) -> str:
+         temperature: float = 0.2, transport: httpx.BaseTransport | None = None) -> str:
     if not enabled():
         raise LLMUnavailable("LLM_API_KEY is not configured")
     usage_id = _reserve(db, owner_id)
-    body = {"model": settings.llm_model, "messages": messages, "temperature": 0.2, "max_tokens": max_tokens}
+    body = {"model": settings.llm_model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     headers = {"Authorization": f"Bearer {settings.llm_api_key}", "Content-Type": "application/json"}
@@ -173,12 +173,12 @@ def _emit_visible(token: str, state: dict, on_token) -> None:
 
 
 def chat_stream(db: Session, owner_id: int, messages: list[dict], on_token, *, max_tokens: int = 700,
-                transport: httpx.BaseTransport | None = None) -> str:
+                temperature: float = 0.2, transport: httpx.BaseTransport | None = None) -> str:
     """Stream visible completion text as provider deltas arrive; return the cleaned full answer."""
     if not enabled():
         raise LLMUnavailable("LLM_API_KEY is not configured")
     usage_id = _reserve(db, owner_id)
-    body = {"model": settings.llm_model, "messages": messages, "temperature": 0.2, "max_tokens": max_tokens, "stream": True}
+    body = {"model": settings.llm_model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "stream": True}
     headers = {"Authorization": f"Bearer {settings.llm_api_key}", "Content-Type": "application/json"}
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     last = "unknown"

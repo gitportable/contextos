@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from fastapi import Depends, HTTPException, Request, Response
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import ratelimit
@@ -154,16 +153,19 @@ def current_user(ctx: AuthContext = Depends(auth_context)) -> User:
 
 
 def is_admin(db: Session, user: User) -> bool:
-    """Admins may open the Pipeline page and the operational endpoints (queue, metrics, service status).
-    Configured with ADMIN_EMAILS. In production the address must also be verified (Google vouched for it), so a password
-    sign-up with someone else's address cannot become admin. With no list set, only in development the first account is admin."""
+    """Admins may open the Pipeline page and the operational endpoints (queue, metrics, service status, index rebuilds).
+
+    Exactly the addresses in ADMIN_EMAILS (default: the owner's address) and nobody else; an empty list means no admin.
+    The address must also be *verified* (Google vouched for it), so a password sign-up typed with the owner's address
+    cannot become admin. The one exception is a local dev server with no Google sign-in configured at all, where
+    nothing could ever be verified.
+    """
     email = normalize_email(user.email)
-    listed = settings.admin_email_set
-    if listed:
-        return email in listed and (user.email_verified or not settings.is_production)
-    if settings.is_production:
+    if email not in settings.admin_email_set:
         return False
-    return user.id == db.query(func.min(User.id)).scalar()
+    if user.email_verified:
+        return True
+    return not settings.is_production and not settings.google_oauth_configured
 
 
 def require_admin(user: User = Depends(current_user), db: Session = Depends(get_db)) -> User:

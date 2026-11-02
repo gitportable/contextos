@@ -6,27 +6,28 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import assistant, auth, ratelimit
+from app import assistant, auth, ranker, ratelimit, triage
 from app.cache import get_json, invalidate_user_caches, set_json
 from app.config import settings
 from app.crypto import TokenCryptoError
 from app.database import SessionLocal, get_db, init_db
 from app.integrations import create_calendar_event, index_messages, integration_status
-from app.models import (EventReceipt, MessageProject, OutboundAction, ProcessingJob, Reminder, SlackConnection, SlackConversation, SlackMessage, SuggestedEvent,
-                        User, utcnow)
+from app.models import (EventReceipt, MessageFeedback, MessageProject, MessageState, OutboundAction, ProcessingJob, Reminder, SlackConnection, SlackConversation, SlackMessage, SuggestedEvent,
+                        User, as_utc, utcnow)
 from app.routes_account import router as account_router
 from app.routes_auth import router as auth_router
 from app.routes_pipeline import router as pipeline_router
@@ -34,7 +35,6 @@ from app.routes_projects import router as projects_router
 from app.routes_gmail import router as gmail_router
 from app.routes_google_calendar import router as google_calendar_router
 from app.routes_intelligence import router as intelligence_router
-from app.routes_items import router as items_router
 from app.routes_slack import router as slack_router
 from app.schemas import AssistantQuery, EventCreate, ReminderCreate, SlackChannelPost, SlackReply
 from app.serializers import message_dicts
@@ -66,7 +66,7 @@ app = FastAPI(title="ContextOS Pipeline API", version="0.5.0", lifespan=lifespan
               docs_url="/docs" if not settings.is_production else None, redoc_url=None,
               openapi_url="/openapi.json" if not settings.is_production else None,
               description="Google sign-in, per-user Slack OAuth, durable queue, resumable sync, priority scoring, projects, LLM summaries, grounded assistant.")
-for _r in (auth_router, slack_router, gmail_router, google_calendar_router, projects_router, pipeline_router, account_router, intelligence_router, items_router):
+for _r in (auth_router, slack_router, gmail_router, google_calendar_router, projects_router, pipeline_router, account_router, intelligence_router):
     app.include_router(_r)
 
 
@@ -168,9 +168,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/api/config")
 def public_config():
+    # Public (no sign-in needed), so it carries only what the sign-in screen needs: nothing about the server's internals.
     return {"demo_enabled": settings.demo_enabled, "registration_open": settings.allow_registration and settings.allow_password_auth,
             "password_auth": settings.allow_password_auth, "google_login": settings.google_oauth_configured,
-            "slack_oauth_configured": settings.slack_oauth_configured, "llm_enabled": settings.llm_enabled, "env": settings.app_env}
+            "slack_oauth_configured": settings.slack_oauth_configured}
 
 
 @app.get("/health")
@@ -226,9 +227,33 @@ def _inbox(db: Session, user: User, include_self: bool = False):
     return q if include_self else q.filter(SlackMessage.is_self.is_(False))
 
 
+def _untriaged(db: Session, user: User, query):
+    return triage.untriaged(db, user.id, query)
+
+
+def _urgent_clause():
+    return triage.urgent_clause()
+
+
+def _collapse_conversations(rows: list[SlackMessage]) -> list[tuple[SlackMessage, int]]:
+    return triage.collapse_conversations(rows)
+
+
+def _with_group_counts(db: Session, pairs: list[tuple[SlackMessage, int]]) -> list[dict]:
+    dicts = message_dicts(db, [r for r, _ in pairs])
+    for d, (_, more) in zip(dicts, pairs):
+        d["more_in_conversation"] = more
+    return dicts
+
+
+def urgent_view(db: Session, user: User, *, expand: bool = False, source: str | None = None):
+    return triage.urgent_view(db, user.id, expand=expand, source=source)
+
+
 @app.get("/messages")
 def list_messages(limit: int = 50, priority: str | None = None, include_self: bool = False, channel_id: str | None = None,
-                  q: str | None = None, project_id: int | None = None, source: str | None = None, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+                  q: str | None = None, project_id: int | None = None, source: str | None = None, expand: bool = False,
+                  user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     limit = max(1, min(limit, 200))
     if source not in (None, "slack", "gmail"):
         raise err(400, "bad_source", "source must be slack or gmail")
@@ -236,12 +261,23 @@ def list_messages(limit: int = 50, priority: str | None = None, include_self: bo
     if priority_filter and priority_filter not in ("important", "urgent", "high", "normal") and priority.upper() not in PRIORITIES:
         raise err(400, "bad_priority", "priority must be important, urgent, high, normal, P0, P1, P2, or P3")
     q = (q or "").strip()[:200] or None
-    params = f"{limit}|{(priority or 'all').upper()}|{int(include_self)}|{channel_id or ''}|{q or ''}|{project_id or ''}|{source or ''}"
+    params = f"{limit}|{(priority or 'all').upper()}|{int(include_self)}|{channel_id or ''}|{q or ''}|{project_id or ''}|{source or ''}|{int(expand)}"
     key = f"contextos:u{user.id}:messages:{hashlib.sha256(params.encode()).hexdigest()[:24]}"
     cached = get_json(key)
     if cached is not None:
         return cached
+    if priority_filter == "urgent" and not (q or channel_id or project_id):
+        pairs, total = urgent_view(db, user, expand=expand, source=source)
+        result = _with_group_counts(db, pairs[:limit])
+        for d in result:
+            d["urgent_total"] = total
+        set_json(key, result, ttl=15)
+        return result
     query = _inbox(db, user, include_self)
+    if priority_filter in ("important", "high", "normal"):
+        # The triage views only show things still waiting for the user: no bots, nothing already done or snoozed, nothing stale.
+        horizon = utcnow() - timedelta(days=14)
+        query = _untriaged(db, user, query).filter(SlackMessage.is_bot.is_(False), triage.when_clause() >= horizon)
     if priority_filter == "urgent":
         query = query.filter(SlackMessage.priority_label.in_(("P0", "P1")))
     elif priority_filter == "high":
@@ -260,16 +296,22 @@ def list_messages(limit: int = 50, priority: str | None = None, include_self: bo
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         query = query.filter(SlackMessage.text.ilike(f"%{esc}%", escape="\\"))
     if priority_filter == "important" and not q:
+        # "Needs attention": at most one card per priority tier, the urgent tier uses the strict definition of urgent.
         rows = []
         for label in PRIORITIES:
-            row = (query.filter(SlackMessage.priority_label == label)
-                   .order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at))
-                   .first())
+            tier = query.filter(SlackMessage.priority_label == label)
+            if label in ("P0", "P1"):
+                tier = tier.filter(_urgent_clause())
+            row = tier.order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).first()
             if row:
                 rows.append(row)
+        result = message_dicts(db, rows)
+    elif priority_filter in ("high", "normal") and not q:
+        rows = query.order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).limit(400).all()
+        result = _with_group_counts(db, _collapse_conversations(rows)[:limit])
     else:
         rows = query.order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).limit(limit).all()
-    result = message_dicts(db, rows)
+        result = message_dicts(db, rows)
     set_json(key, result, ttl=15)
     return result
 
@@ -284,6 +326,116 @@ def _own_message(db: Session, user: User, message_id: int) -> SlackMessage:
 @app.get("/messages/{message_id}")
 def get_message(message_id: int, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     return message_dicts(db, [_own_message(db, user, message_id)])[0]
+
+
+# ---------------------------------------------------------- triage (done / snooze) ---
+class DoneIn(BaseModel):
+    scope: Literal["message", "conversation"] = "conversation"
+
+
+class SnoozeIn(BaseModel):
+    hours: int = Field(default=4, ge=1, le=24 * 14)
+    scope: Literal["message", "conversation"] = "conversation"
+
+
+def _triage_targets(db: Session, user: User, row: SlackMessage, scope: str) -> list[int]:
+    """The message itself, or everything in its conversation up to and including it ("mark as read up to here")."""
+    if scope == "message":
+        return [row.id]
+    q = db.query(SlackMessage.id).filter(SlackMessage.owner_id == user.id, SlackMessage.connection_id == row.connection_id,
+                                         SlackMessage.channel_id == row.channel_id, SlackMessage.is_deleted.is_(False))
+    if row.thread_ts:
+        q = q.filter(SlackMessage.thread_ts == row.thread_ts)
+    if row.message_created_at is not None:
+        q = q.filter(SlackMessage.message_created_at <= row.message_created_at)
+    ids = [i for (i,) in q.limit(500).all()]
+    return ids if row.id in ids else ids + [row.id]
+
+
+def _set_state(db: Session, user: User, ids: list[int], *, handled: bool | None = None, snooze_until=None, clear: bool = False) -> None:
+    """Idempotent: a double click (two requests at once) must not hit the unique constraint and return a 500."""
+    for attempt in (1, 2):
+        have = {st.message_id: st for st in db.query(MessageState).filter(MessageState.owner_id == user.id, MessageState.message_id.in_(ids)).all()}
+        for mid in ids:
+            st = have.get(mid)
+            if clear:
+                if st is not None:
+                    db.delete(st)
+                continue
+            if st is None:
+                st = MessageState(owner_id=user.id, message_id=mid)
+                db.add(st)
+            if handled is not None:
+                st.handled_at = utcnow() if handled else None
+            if snooze_until is not None:
+                st.snoozed_until = snooze_until
+        try:
+            db.commit()
+            break
+        except IntegrityError:
+            db.rollback()
+            if attempt == 2:
+                raise
+    invalidate_user_caches(user.id)
+
+
+@app.post("/messages/{message_id}/handled")
+def mark_handled(message_id: int, data: DoneIn | None = None, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    row = _own_message(db, user, message_id)
+    ids = _triage_targets(db, user, row, (data or DoneIn()).scope)
+    _set_state(db, user, ids, handled=True)
+    return {"ok": True, "cleared": len(ids), "ids": ids}
+
+
+@app.post("/messages/{message_id}/snooze")
+def snooze_message(message_id: int, data: SnoozeIn | None = None, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    data = data or SnoozeIn()
+    row = _own_message(db, user, message_id)
+    ids = _triage_targets(db, user, row, data.scope)
+    until = utcnow() + timedelta(hours=data.hours)
+    _set_state(db, user, ids, snooze_until=until)
+    return {"ok": True, "cleared": len(ids), "ids": ids, "until": until.isoformat()}
+
+
+class UndoIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=600)
+
+
+@app.post("/messages/triage/undo")
+def undo_triage(data: UndoIn, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    own = [i for (i,) in db.query(SlackMessage.id).filter(SlackMessage.owner_id == user.id, SlackMessage.id.in_(data.ids)).all()]
+    db.query(MessageFeedback).filter(MessageFeedback.owner_id == user.id, MessageFeedback.message_id.in_(own)).delete(synchronize_session=False)
+    _set_state(db, user, own, clear=True)
+    return {"ok": True, "restored": len(own)}
+
+
+class FeedbackIn(BaseModel):
+    label: Literal["not_urgent", "wrong_person", "not_mine", "always_show"]
+    scope: Literal["conversation", "message"] = "conversation"
+
+
+@app.post("/messages/{message_id}/feedback")
+def message_feedback(message_id: int, data: FeedbackIn, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
+    """Teach the ranker. 'Not urgent', 'Wrong person' and 'Not mine' clear the conversation now and lower that sender next time;
+    'Always show' pins it to Urgent and raises the sender. Undo (the same endpoint as Done) takes the label back."""
+    row = _own_message(db, user, message_id)
+    ids = _triage_targets(db, user, row, data.scope) if data.label != "always_show" else [row.id]
+    key = ranker.sender_key(row)
+    for mid in ids:
+        fb = db.query(MessageFeedback).filter_by(owner_id=user.id, message_id=mid).first()
+        if fb is None:
+            db.add(MessageFeedback(owner_id=user.id, message_id=mid, sender_key=key, label=data.label))
+        else:
+            fb.label, fb.sender_key = data.label, key
+    try:
+        db.commit()
+    except IntegrityError:  # a double click raced us: the label is already stored
+        db.rollback()
+    if data.label == "always_show":
+        _set_state(db, user, ids, clear=True)
+    else:
+        _set_state(db, user, ids, handled=True)
+    return {"ok": True, "label": data.label, "cleared": 0 if data.label == "always_show" else len(ids), "ids": ids}
 
 
 def _action_dict(a: OutboundAction) -> dict:
@@ -498,8 +650,12 @@ def pipeline_metrics(user: User = Depends(auth.require_admin), db: Session = Dep
 @app.get("/dashboard/summary")
 def dashboard_summary(user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     m = _metrics(db, user)
-    return {"messages_total": m["messages"], "by_priority": m["priorities"], "pending_reminders": m["reminders_pending"],
-            "suggested_events": m["suggestions_pending"], "queued_jobs": m["jobs"].get("queued", 0), "failed_jobs": m["jobs"].get("failed", 0)}
+    _, urgent_total = urgent_view(db, user, expand=True)
+    base = {"messages_total": m["messages"], "by_priority": m["priorities"], "urgent": urgent_total, "pending_reminders": m["reminders_pending"],
+            "suggested_events": m["suggestions_pending"]}
+    if auth.is_admin(db, user):  # queue health is operational detail: only the administrator sees it
+        base.update(queued_jobs=m["jobs"].get("queued", 0), failed_jobs=m["jobs"].get("failed", 0))
+    return base
 
 
 # --------------------------------------------------------------- reminders ---
@@ -521,7 +677,16 @@ def create_reminder(data: ReminderCreate, user: User = Depends(auth.current_user
 def list_reminders(status: str = "pending", limit: int = 100, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     q = db.query(Reminder).filter(Reminder.owner_id == user.id)
     q = q.filter(Reminder.status != "cancelled") if status == "all" else q.filter(Reminder.status == status)
-    return [_rem(r) for r in q.order_by(Reminder.due_at).limit(max(1, min(limit, 200))).all()]
+    if status == "pending":  # a to-do that came due more than 3 days ago and was never touched is clutter, not a reminder
+        q = q.filter(Reminder.due_at >= utcnow() - timedelta(days=3))
+    seen, out = set(), []
+    for r in q.order_by(Reminder.due_at).limit(max(1, min(limit, 200)) * 2).all():
+        key = (" ".join((r.title or "").lower().split())[:80], as_utc(r.due_at).replace(second=0, microsecond=0))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_rem(r))
+    return out[:max(1, min(limit, 200))]
 
 
 @app.post("/reminders/{reminder_id}/complete")
@@ -551,7 +716,17 @@ def _own_event(db, user, event_id):
 def list_suggestions(status: str = "suggested", user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
     q = db.query(SuggestedEvent).filter(SuggestedEvent.owner_id == user.id)
     q = q.filter(SuggestedEvent.status != "cancelled") if status == "all" else q.filter(SuggestedEvent.status == status)
-    return [_ev(e) for e in q.order_by(SuggestedEvent.proposed_start).limit(200).all()]
+    if status == "suggested":
+        # A meeting whose time nobody stated (we only guessed "tomorrow 2pm") is a hunch, and one already in the past is moot.
+        q = q.filter(SuggestedEvent.is_provisional.is_(False), SuggestedEvent.proposed_start >= utcnow() - timedelta(hours=1))
+    seen, out = set(), []
+    for e in q.order_by(SuggestedEvent.proposed_start).limit(200).all():
+        key = (" ".join((e.title or "").lower().split())[:80], as_utc(e.proposed_start).replace(second=0, microsecond=0))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_ev(e))
+    return out
 
 
 @app.post("/schedule/suggestions")
@@ -585,6 +760,13 @@ def approve_and_create_calendar_event(event_id: int, user: User = Depends(auth.c
 
 
 # --------------------------------------------------------------- assistant ---
+def _public_assistant_result(db: Session, user: User, result: dict) -> dict:
+    """Which engine answered, rate-limit notes and graph backends are pipeline internals: only the administrator sees them."""
+    if auth.is_admin(db, user):
+        return result
+    return {k: v for k, v in result.items() if k not in ("mode", "note", "graph_source")}
+
+
 @app.post("/assistant/ask/stream")
 def assistant_ask_stream(data: AssistantQuery, user: User = Depends(auth.current_user)):
     owner_id = user.id
@@ -597,6 +779,12 @@ def assistant_ask_stream(data: AssistantQuery, user: User = Depends(auth.current
     def events():
         updates: queue.Queue = queue.Queue()
         finished = object()
+        cancelled = threading.Event()
+
+        def put(kind, payload):
+            if cancelled.is_set():  # the browser went away: stop spending LLM quota on an answer nobody will read
+                raise RuntimeError("client_disconnected")
+            updates.put((kind, payload))
 
         def generate():
             db = SessionLocal()
@@ -607,22 +795,36 @@ def assistant_ask_stream(data: AssistantQuery, user: User = Depends(auth.current
                 history = [{"role": turn.role, "content": turn.content} for turn in data.history]
                 result = assistant.ask(db, stream_user, data.question.strip(),
                                        history=history,
-                                       on_token=lambda token: updates.put(("token", {"text": token})))
-                updates.put(("done", result))
+                                       on_sources=lambda found: put("sources", {"sources": found}),
+                                       on_token=lambda token: put("token", {"text": token}))
+                put("done", _public_assistant_result(db, stream_user, result))
             except Exception:
-                logger.exception("assistant_stream_failed user_id=%s", owner_id)
-                updates.put(("error", {"message": "The assistant could not finish this response. Please try again."}))
+                if not cancelled.is_set():
+                    logger.exception("assistant_stream_failed user_id=%s", owner_id)
+                    updates.put(("error", {"message": "The assistant could not finish this response. Please try again."}))
             finally:
                 db.close()
                 updates.put(finished)
 
         threading.Thread(target=generate, daemon=True).start()
-        while True:
-            item = updates.get()
-            if item is finished:
-                break
-            event, payload = item
-            yield f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        deadline = time.monotonic() + 120
+        try:
+            while True:
+                try:
+                    item = updates.get(timeout=10)
+                except queue.Empty:
+                    if time.monotonic() > deadline:  # a hung model call must not leave the page spinning forever
+                        cancelled.set()
+                        yield "event: error\ndata: " + json.dumps({"message": "The assistant took too long. Please try again."}) + "\n\n"
+                        return
+                    yield ": keep-alive\n\n"  # keeps proxies (ngrok) from closing an idle stream
+                    continue
+                if item is finished:
+                    break
+                event, payload = item
+                yield f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        finally:
+            cancelled.set()
 
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -636,8 +838,9 @@ def assistant_ask(data: AssistantQuery, user: User = Depends(auth.current_user),
     except ratelimit.RateLimited as exc:
         raise ratelimit.ensure_http(exc) from exc
     history = [{"role": turn.role, "content": turn.content} for turn in data.history]
-    result = assistant.ask(db, user, data.question.strip(), history=history)
-    result["vector_search"] = "configured" if settings.qdrant_enabled else "not_configured"
+    result = _public_assistant_result(db, user, assistant.ask(db, user, data.question.strip(), history=history))
+    if auth.is_admin(db, user):
+        result["vector_search"] = "configured" if settings.qdrant_enabled else "not_configured"
     return result
 
 
