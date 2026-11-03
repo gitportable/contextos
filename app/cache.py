@@ -11,7 +11,7 @@ import time
 from app.config import settings
 
 log = logging.getLogger("contextos.cache")
-COOLDOWN = 15.0
+COOLDOWN = 60.0
 _lock = threading.Lock()
 _client = None
 _down_until = 0.0
@@ -19,7 +19,7 @@ _down_until = 0.0
 
 def _connect():
     import redis
-    c = redis.Redis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=1)
+    c = redis.Redis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=0.25, socket_timeout=0.25, retry_on_timeout=False, health_check_interval=30)
     c.ping()
     return c
 
