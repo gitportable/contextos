@@ -11,8 +11,8 @@ def _engine_options() -> dict:
     and fail fast instead of hanging forever when the host is unreachable."""
     opts: dict = {"pool_pre_ping": True}
     if settings.database_url.startswith("postgresql"):
-        opts.update(pool_size=5, max_overflow=5, pool_recycle=240, pool_timeout=20,
-                    connect_args={"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3})
+        opts.update(pool_size=5, max_overflow=2, pool_recycle=180, pool_timeout=5,
+                    connect_args={"connect_timeout": 5, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3})
     return opts
 
 
