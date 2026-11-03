@@ -20,6 +20,9 @@ function h(tag, props, ...kids) {
   return el;
 }
 const $ = (s, r = document) => r.querySelector(s);
+const getCache = new Map();
+const getInflight = new Map();
+const GET_CACHE_MS = 2500;
 const state = { settingsTab: 'connections', expand: false, csrf: null, user: null, config: {}, tab: 'assistant', timers: [], levelsInfo: null, filter: 'important', source: '', query: '', eventCursor: 0, stageFilter: null, events: [] };
 
 class ApiError extends Error {
@@ -27,6 +30,16 @@ class ApiError extends Error {
 }
 
 async function api(path, { method = 'GET', body, quiet401 = false } = {}) {
+  const cacheKey = method === 'GET' ? path : null;
+  if (cacheKey) {
+    const cached = getCache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) return cached.data;
+    if (getInflight.has(cacheKey)) return getInflight.get(cacheKey);
+  } else {
+    // Any write may change data shown by another page; do not serve stale GET results after mutations.
+    getCache.clear();
+  }
+  const request = (async () => {
   const headers = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (method !== 'GET' && state.csrf) headers['X-CSRF-Token'] = state.csrf;
@@ -42,12 +55,22 @@ async function api(path, { method = 'GET', body, quiet401 = false } = {}) {
   }
   let data = null;
   try { data = await res.json(); } catch { /* empty or non-JSON */ }
-  if (res.ok) return data;
+  if (res.ok) {
+    if (cacheKey) {
+      if (getCache.size > 300) getCache.clear();
+      getCache.set(cacheKey, { data, expires: Date.now() + GET_CACHE_MS });
+    }
+    return data;
+  }
   const d = (data && data.detail) || {};
   const retry = d.retry_after || parseInt(res.headers.get('Retry-After') || '0', 10) || 0;
   const err = new ApiError(res.status, d.code || 'error', d.message || (typeof d === 'string' ? d : 'Something went wrong. Please try again.'), retry);
   if (res.status === 401 && !quiet401 && state.user) { sessionEnded(); }
   throw err;
+  })();
+  if (cacheKey) getInflight.set(cacheKey, request);
+  try { return await request; }
+  finally { if (cacheKey && getInflight.get(cacheKey) === request) getInflight.delete(cacheKey); }
 }
 
 async function streamAssistant(question, onToken, history = [], onSources = () => {}) {
@@ -357,7 +380,7 @@ function renderShell() {
     visibleTabs().map(([id, ico, label]) => h('button', { type: 'button', 'aria-current': state.tab === id ? 'page' : null, onclick: () => go(id) }, h('span', { 'aria-hidden': 'true' }, ico), label)),
     h('div', { class: 'grow' }), h('div', { class: 'me' }, h('b', {}, state.user.name || 'Your account'), h('span', {}, state.user.email),
       h('button', { class: 'signout-link', type: 'button', onclick: signOut }, 'Sign out')));
-  const main = h('main', { class: state.tab === 'assistant' ? 'main assistant-main' : 'main', id: 'view' });
+  const main = h('main', { class: state.tab === 'assistant' ? 'main assistant-main' : 'main', id: 'view' }, h('div', { class: 'panel loading-panel', role: 'status' }, h('span', { class: 'spin', 'aria-hidden': 'true' }), ' Loading your workspace…'));
   $('#app').replaceChildren(h('div', { class: 'shell' }, nav, main));
   if (!visibleTabs().some((t) => t[0] === state.tab)) state.tab = 'assistant';
   document.title = `${TABS.find((t) => t[0] === state.tab)[2]} · ContextOS`;
