@@ -197,32 +197,32 @@ class Settings(BaseSettings):
             v = urlunparse(u._replace(query=urlencode(q)))
         return v
         @field_validator("redis_url", mode="after")
-    @classmethod
-    def _tidy_redis_url(cls, v: str) -> str:
-        """Accept only valid Redis connection URL formats."""
-        v = (v or "").strip()
-
-        if not v:
-            return ""
-
-        try:
-            parsed = urlparse(v)
-
-            if parsed.scheme not in ("redis", "rediss"):
-                raise ValueError(
-                    "REDIS_URL must start with redis:// or rediss://"
-                )
-
-            if not parsed.hostname:
-                raise ValueError("REDIS_URL must contain a hostname")
-
-            if parsed.port is not None and not (1 <= parsed.port <= 65535):
-                raise ValueError("REDIS_URL contains an invalid port")
-
-        except ValueError as exc:
-            raise ValueError(f"Invalid REDIS_URL: {exc}") from exc
-
-        return v
+        @classmethod
+        def _tidy_redis_url(cls, v: str) -> str:
+            """Accept only valid Redis connection URL formats."""
+            v = (v or "").strip()
+    
+            if not v:
+                return ""
+    
+            try:
+                parsed = urlparse(v)
+    
+                if parsed.scheme not in ("redis", "rediss"):
+                    raise ValueError(
+                        "REDIS_URL must start with redis:// or rediss://"
+                    )
+    
+                if not parsed.hostname:
+                    raise ValueError("REDIS_URL must contain a hostname")
+    
+                if parsed.port is not None and not (1 <= parsed.port <= 65535):
+                    raise ValueError("REDIS_URL contains an invalid port")
+    
+            except ValueError as exc:
+                raise ValueError(f"Invalid REDIS_URL: {exc}") from exc
+    
+            return v
     # --- derived ----------------------------------------------------------
     @property
     def redirect_uri(self) -> str:
