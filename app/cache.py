@@ -38,8 +38,14 @@ def client():
             try:
                 _client = _connect()
             except Exception as exc:
-                log.warning("redis_unavailable %s; retrying in %ss", type(exc).__name__, int(COOLDOWN))
-                _down_until = time.monotonic() + COOLDOWN
+                log.warning(
+                    "redis_unavailable %s: %s; retrying in %ss",
+                    type(exc).__name__,
+                    str(exc)[:300],
+                    int(COOLDOWN),
+                )
+                # log.warning("redis_unavailable %s; retrying in %ss", type(exc).__name__, int(COOLDOWN))
+                # _down_until = time.monotonic() + COOLDOWN
         return _client
 
 

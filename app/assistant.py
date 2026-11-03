@@ -12,12 +12,13 @@ the answer is the extractive version of the same context.
 """
 import logging
 import re
+
+import json
+import time as pytime
 from datetime import datetime, time, timedelta, timezone
 from typing import Callable
-
-from sqlalchemy import desc
 from sqlalchemy.orm import Session
-
+from sqlalchemy import desc, or_
 from app import google_calendar, integrations, llm, pipeline_events, projects, summaries, triage
 from app.models import (AssistantNote, MessageProject, Project, SlackConnection, SlackConversation, SlackMessage,
                         SlackUser, SuggestedEvent, User, as_utc, utcnow)
@@ -135,22 +136,109 @@ def _matched_projects(db: Session, owner_id: int, question: str) -> list[Project
     return (db.query(Project).filter(Project.id.in_(list(hits)), Project.owner_id == owner_id, Project.status.in_(("auto", "confirmed")))
             .order_by(desc(Project.score)).limit(3).all())
 
+def _rank_messages(
+    db: Session,
+    owner_id: int,
+    question: str,
+    project_ids: list[int],
+    limit: int = 8,
+) -> list[SlackMessage]:
 
-def _rank_messages(db: Session, owner_id: int, question: str, project_ids: list[int], limit: int = 8) -> list[SlackMessage]:
-    q = db.query(SlackMessage).filter(SlackMessage.owner_id == owner_id, SlackMessage.is_deleted.is_(False))
+    q = db.query(SlackMessage).filter(
+        SlackMessage.owner_id == owner_id,
+        SlackMessage.is_deleted.is_(False),
+    )
+
     if project_ids:
-        q = q.join(MessageProject, MessageProject.message_id == SlackMessage.id).filter(MessageProject.project_id.in_(project_ids))
-    rows = q.order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).limit(1500).all()
+        q = (
+            q.join(
+                MessageProject,
+                MessageProject.message_id == SlackMessage.id,
+            )
+            .filter(MessageProject.project_id.in_(project_ids))
+        )
+
     terms = _terms(question)
-    scored = [(sum(1 for t in terms if t in r.text.lower()), r) for r in rows]
-    ranked = [r for n, r in sorted(scored, key=lambda x: (x[0], x[1].priority_score), reverse=True) if n > 0 or project_ids][:limit]
-    vec_ids = [h["message_id"] for h in integrations.search_vectors(question, owner_id, 5, project_ids=project_ids or None) if h.get("message_id")]
-    if vec_ids:
-        have = {r.id for r in ranked}
-        extra = (db.query(SlackMessage).filter(SlackMessage.owner_id == owner_id, SlackMessage.is_deleted.is_(False),
-                                               SlackMessage.id.in_([i for i in vec_ids if i not in have])).all())
-        ranked = (ranked + extra)[: limit + 4]
+
+    # Filter matching messages in PostgreSQL instead of loading 1,500 rows.
+    if terms:
+        q = q.filter(
+            or_(*[
+                SlackMessage.text.ilike(f"%{term}%")
+                for term in terms
+            ])
+        )
+
+    rows = (
+        q.order_by(
+            desc(SlackMessage.priority_score),
+            desc(SlackMessage.message_created_at),
+        )
+        .limit(40)
+        .all()
+    )
+
+    # Rank only the small candidate set.
+    ranked = sorted(
+        rows,
+        key=lambda message: (
+            sum(
+                1 for term in terms
+                if term in (message.text or "").lower()
+            ),
+            message.priority_score or 0,
+        ),
+        reverse=True,
+    )[:limit]
+
+    # Add semantic matches from Qdrant.
+    vec_ids = [
+        hit["message_id"]
+        for hit in integrations.search_vectors(
+            question,
+            owner_id,
+            5,
+            project_ids=project_ids or None,
+        )
+        if hit.get("message_id")
+    ]
+
+    existing_ids = {message.id for message in ranked}
+    missing_ids = [
+        message_id for message_id in vec_ids
+        if message_id not in existing_ids
+    ]
+
+    if missing_ids:
+        extra = (
+            db.query(SlackMessage)
+            .filter(
+                SlackMessage.owner_id == owner_id,
+                SlackMessage.is_deleted.is_(False),
+                SlackMessage.id.in_(missing_ids),
+            )
+            .all()
+        )
+
+        ranked = (ranked + extra)[:limit + 4]
+
     return ranked
+
+# def _rank_messages(db: Session, owner_id: int, question: str, project_ids: list[int], limit: int = 8) -> list[SlackMessage]:
+#     q = db.query(SlackMessage).filter(SlackMessage.owner_id == owner_id, SlackMessage.is_deleted.is_(False))
+#     if project_ids:
+#         q = q.join(MessageProject, MessageProject.message_id == SlackMessage.id).filter(MessageProject.project_id.in_(project_ids))
+#     rows = q.order_by(desc(SlackMessage.priority_score), desc(SlackMessage.message_created_at)).limit(1500).all()
+#     terms = _terms(question)
+#     scored = [(sum(1 for t in terms if t in r.text.lower()), r) for r in rows]
+#     ranked = [r for n, r in sorted(scored, key=lambda x: (x[0], x[1].priority_score), reverse=True) if n > 0 or project_ids][:limit]
+#     vec_ids = [h["message_id"] for h in integrations.search_vectors(question, owner_id, 5, project_ids=project_ids or None) if h.get("message_id")]
+#     if vec_ids:
+#         have = {r.id for r in ranked}
+#         extra = (db.query(SlackMessage).filter(SlackMessage.owner_id == owner_id, SlackMessage.is_deleted.is_(False),
+#                                                SlackMessage.id.in_([i for i in vec_ids if i not in have])).all())
+#         ranked = (ranked + extra)[: limit + 4]
+#     return ranked
 
 
 def _src(m: SlackMessage) -> dict:
@@ -551,6 +639,8 @@ def _history_turns(history: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def ask(db: Session, user: User, question: str, on_token: Callable[[str], None] | None = None,
         history: list[dict[str, str]] | None = None, on_sources: Callable[[list[dict]], None] | None = None) -> dict:
+    request_started = pytime.perf_counter()
+    retrieval_started = pytime.perf_counter()
     owner_id = user.id
     history = [
         {"role": turn["role"], "content": turn["content"][:1500]}
@@ -633,7 +723,17 @@ def ask(db: Session, user: User, question: str, on_token: Callable[[str], None] 
         ppl = sorted(merged.values(), key=lambda x: -x.get("messages", 0))
         rel, rsrc = projects.related_projects(db, owner_id, p.id, 3)
         who.append((p, ppl, rel))
+    retrieval_ms = (
+        pytime.perf_counter() - retrieval_started
+    ) * 1000
 
+    log.info(
+        "assistant_retrieval owner=%s elapsed_ms=%.1f projects=%s messages=%s",
+        owner_id,
+        retrieval_ms,
+        len(matched),
+        len(msgs),
+    )
     # ---- decide what is being answered, and with which numbered sources -----------------------------------------
     facts: str | None = None          # text the app already verified (it carries its own [n] markers)
     sources: list[dict] = []
@@ -673,6 +773,13 @@ def ask(db: Session, user: User, question: str, on_token: Callable[[str], None] 
     def ask_model(context: str) -> bool:
         """One LLM call with the shared persona. Fills `answer` and `cited`; returns False when the model is unavailable."""
         nonlocal answer, mode, note
+        llm_started = pytime.perf_counter()
+        log.info(
+            "assistant_llm owner=%s elapsed_ms=%.1f streamed=%s",
+            owner_id,
+            (pytime.perf_counter() - llm_started) * 1000,
+            streamed,
+        )
         conversation = _history_turns(useful_history)
         prompt = [{"role": "system", "content": _system_prompt(user)}, *conversation,
                   {"role": "user", "content": context + f"\n\nQuestion: {llm.fence(question)}"}]
