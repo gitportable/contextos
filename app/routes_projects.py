@@ -47,15 +47,40 @@ def _slug(db: Session, owner_id: int, name: str, exclude_id: int | None = None) 
     return slug
 
 
-def _card(db: Session, p: Project) -> dict:
-    s = summaries.latest(db, p.id)
-    kws = [k for (k,) in db.query(ProjectKeyword.keyword).filter_by(project_id=p.id).order_by(ProjectKeyword.is_primary.desc(), ProjectKeyword.keyword).all()]
-    return {"id": p.id, "name": p.name, "slug": p.slug, "status": p.status, "keywords": kws, "message_count": p.message_count,
+def _card_data(p: Project, summary: ProjectSummary | None, keywords: list[str]) -> dict:
+    return {"id": p.id, "name": p.name, "slug": p.slug, "status": p.status, "keywords": keywords, "message_count": p.message_count,
             "channel_count": p.channel_count, "author_count": p.author_count, "score": round(p.score, 2),
             "first_seen_at": p.first_seen_at.isoformat() if p.first_seen_at else None,
             "last_seen_at": p.last_seen_at.isoformat() if p.last_seen_at else None,
-            "health": s.status_label if s else "unknown", "summary_mode": s.mode if s else None,
-            "summary_preview": (s.summary_text[:200] if s else None)}
+            "health": summary.status_label if summary else "unknown", "summary_mode": summary.mode if summary else None,
+            "summary_preview": (summary.summary_text[:200] if summary else None)}
+
+def _card(db: Session, p: Project) -> dict:
+    """Detailed single-project serializer; list endpoints use _cards to batch related reads."""
+    summary = summaries.latest(db, p.id)
+    keywords = [k for (k,) in db.query(ProjectKeyword.keyword).filter_by(project_id=p.id)
+                .order_by(ProjectKeyword.is_primary.desc(), ProjectKeyword.keyword).all()]
+    return _card_data(p, summary, keywords)
+
+def _cards(db: Session, projects_list: list[Project]) -> list[dict]:
+    """Serialize a project list with three bounded queries instead of 1 + 2N queries."""
+    if not projects_list:
+        return []
+    ids = [p.id for p in projects_list]
+    latest_versions = (db.query(ProjectSummary.project_id, func.max(ProjectSummary.version).label("version"))
+                       .filter(ProjectSummary.project_id.in_(ids))
+                       .group_by(ProjectSummary.project_id).subquery())
+    latest_rows = (db.query(ProjectSummary).join(latest_versions,
+                    (ProjectSummary.project_id == latest_versions.c.project_id) &
+                    (ProjectSummary.version == latest_versions.c.version)).all())
+    summaries_by_id = {row.project_id: row for row in latest_rows}
+    keyword_rows = (db.query(ProjectKeyword.project_id, ProjectKeyword.keyword)
+                    .filter(ProjectKeyword.project_id.in_(ids))
+                    .order_by(ProjectKeyword.is_primary.desc(), ProjectKeyword.keyword).all())
+    keywords_by_id: dict[int, list[str]] = {}
+    for project_id, keyword in keyword_rows:
+        keywords_by_id.setdefault(project_id, []).append(keyword)
+    return [_card_data(p, summaries_by_id.get(p.id), keywords_by_id.get(p.id, [])) for p in projects_list]
 
 
 _drain_lock = threading.Lock()
@@ -85,8 +110,9 @@ def _run_queue_here(background: BackgroundTasks, db: Session) -> str:
 def list_projects(background: BackgroundTasks, include: str = "active", user: User = Depends(current_user), db: Session = Depends(get_db)):
     q = db.query(Project).filter(Project.owner_id == user.id)
     q = q if include == "all" else q.filter(Project.status.in_(("auto", "confirmed")))
-    risks = intelligence.project_risks(db, user)
-    cards = [{**_card(db, p), "risk": risks.get(p.id)} for p in q.order_by(desc(Project.message_count), desc(Project.score)).limit(100).all()]
+    project_rows = q.order_by(desc(Project.message_count), desc(Project.score)).limit(100).all()
+    risks = intelligence.project_risks(db, user) if project_rows else {}
+    cards = [{**card, "risk": risks.get(card["id"])} for card in _cards(db, project_rows)]
     if not cards and include != "all":
         # First visit (or never discovered): look for projects now instead of showing an empty page and waiting for the scheduler.
         discovered = db.query(User.projects_discovered_at).filter_by(id=user.id).scalar()
