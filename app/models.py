@@ -316,6 +316,7 @@ class Project(Base):
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String(100))
     slug: Mapped[str] = mapped_column(String(120))
+    renamed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     status: Mapped[str] = mapped_column(String(20), default="auto", index=True)
     score: Mapped[float] = mapped_column(Float, default=0.0)
     message_count: Mapped[int] = mapped_column(Integer, default=0)
