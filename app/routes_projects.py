@@ -178,6 +178,7 @@ def patch_project(project_id: int, data: ProjectPatch, user: User = Depends(curr
     p = _own(db, user, project_id)
     if data.name is not None:
         p.name, p.slug = data.name.strip(), _slug(db, user.id, data.name, p.id)
+        p.renamed = True
         if p.status == "auto":
             p.status = "confirmed"  # the user touched it: discovery must not rename or retire it
     if data.keywords is not None:
